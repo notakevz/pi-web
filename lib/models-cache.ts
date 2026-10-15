@@ -1,11 +1,15 @@
 export interface ModelsData {
   models: Record<string, string>;
-  modelList: { id: string; name: string; provider: string; input?: string[] }[];
+  modelList: { id: string; name: string; provider: string; input?: string[]; thinkingToggle?: boolean }[];
   defaultModel: { provider: string; modelId: string } | null;
   /** Resolved thinking level a new session starts with when the user has not picked one. */
   defaultThinkingLevel: string | null;
-  /** `defaultThinkingLevel` as saved in settings, which the reasoning selector's star marks. */
+  /** Raw global fallback setting, without project overrides, per-model defaults or scope pins. */
   savedDefaultThinkingLevel: string | null;
+  /** Effective ordinary thinking fallback, including a project's override. */
+  fallbackThinkingLevel?: string | null;
+  /** Effective user/project per-model startup defaults, keyed by exact `provider/modelId`. */
+  modelThinkingDefaults: Record<string, string>;
   thinkingLevels: Record<string, string[]>;
   thinkingLevelMaps: Record<string, Record<string, string | null>>;
   /** `provider/modelId` → thinking level pinned by an `enabledModels` `:level` suffix. */

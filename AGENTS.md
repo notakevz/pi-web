@@ -109,18 +109,20 @@ lib/
   sidebar-actions.ts        session row menu entries, a project group's name entries and rename request, fork refusal messages, delete-all requests
   session-links.ts          a session's same-instance link (?session=<id>) and the plain-click rule the sidebar keeps in the page
   new-session-context.ts    client-safe: what the project/worktree pickers show (project, worktrees, project list), lag-safe contextForCwd
+  session-view-prefetch.ts  bounded 5 s background active-session history warming; reuses the running poll, no SSE/runtime starts
   normalize.ts              normalizeToolCalls(): file-format vs our toolCall field names
   types.ts                  shared TypeScript types
   pi-types.ts               local structural types for pi SDK objects
   pi-sdk-internals.ts       loader for SDK modules the package does not export (MCP connection, config, OAuth)
   tool-presets.ts           PRESET_NONE/READ_ONLY/DEFAULT/FULL + getPresetFromTools()
-  tool-preset-preference.ts browser-persisted default preset for fresh sessions
+  tool-preset-preference.ts legacy browser preference compatibility; fresh composers now start full
   builtin-extensions.ts     codemode / tool-search / mcp built-ins, sandbox self-test, -builtin: switches
   codemode-settings.ts      Code mode automatic/always (+codemode in global defaultTools), codemode.mode and inlineBudget; project overrides
   codemode-view.ts          display helpers for codemode cards
   global-settings-file.ts   locked read-modify-write of global settings.json (SettingsManager's lock)
   regular-file.ts           readRegularFileText(): non-blocking read of a regular file only, optional size cap
-  default-preferences.ts    write defaultModel/defaultThinkingLevel; detect project shadowing
+  default-preferences.ts    write defaultModel or exact modelThinkingLevels; legacy global thinking writes; detect project shadowing
+  model-thinking-defaults.ts client-safe per-model reasoning resolution and SDK-equivalent supported-level clamping
   deferred-provider-models.ts models of providers an extension registers only at session_start, re-added to listings
   enabled-models.ts         pure minimal-edit engine for the enabledModels pattern list
   enabled-models-runtime.ts SDK adapter for enabledModels: pattern resolution, provider kinds, settings IO
@@ -213,6 +215,7 @@ components/
 hooks/
   useAgentSession.ts       messages, streaming, SSE, fork/navigate, reconciliation; built-in slash commands (/session, bare /mcp)
   useStreamingSelector.ts  one value of the streaming store (lib/streaming-message.ts): a chunk re-renders only its subscribers
+  useBackgroundSessionRefresh.ts confirmed-history prefetch lifecycle; visible/online only, foreground cache protection
   useAudio.ts              completion sound + AudioContext unlock
   useDragDrop.ts           chat drop zone: dropped files, folders marked
   useFilesPlacement.ts     per-browser choice: the desktop sidebar's file browser below the sessions or in its own tab

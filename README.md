@@ -1,5 +1,7 @@
 # Pi Web
 
+> Fork customizations are documented in [docs/fork.md](docs/fork.md). Machine-specific deployment tools and records are maintained outside this repository; installing the upstream npm package does not preserve these customizations.
+
 [中文文档](./docs/README.zh-CN.md) | [日本語](./docs/README.ja.md) | [Русский](./docs/README.ru.md)
 
 Local browser UI for the [pi coding agent](https://github.com/earendil-works/pi). Pi Web uses the same local configuration and session files as pi, so you can browse and resume conversations, run agent turns, configure models and resources, and inspect project files from a browser.

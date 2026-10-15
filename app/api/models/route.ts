@@ -14,6 +14,7 @@ import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-acces
 import { projectTrustReloadOptions } from "@/lib/project-trust";
 import { rememberProviderModels, withDeferredProviderModels } from "@/lib/deferred-provider-models";
 import { inferRemovedWorktree } from "@/lib/worktree";
+import { hasThinkingToggle } from "@/lib/thinking-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -49,6 +50,7 @@ async function loadModels(cwd: string): Promise<ModelsData> {
     name: m.name,
     provider: m.provider,
     input: m.input,
+    thinkingToggle: hasThinkingToggle(m),
   }));
   for (const m of visible) {
     const key = `${m.provider}:${m.id}`;
@@ -80,7 +82,9 @@ async function loadModels(cwd: string): Promise<ModelsData> {
       modelList,
       defaultModel,
       defaultThinkingLevel,
-      savedDefaultThinkingLevel: settings.getDefaultThinkingLevel() ?? null,
+      savedDefaultThinkingLevel: settings.getGlobalSettings().defaultThinkingLevel ?? null,
+      fallbackThinkingLevel: settings.getDefaultThinkingLevel() ?? null,
+      modelThinkingDefaults: settings.getAllModelThinkingLevels(),
       thinkingLevels,
       thinkingLevelMaps,
       thinkingLevelPins,
@@ -96,6 +100,8 @@ const EMPTY_MODELS: ModelsData = {
   defaultModel: null,
   defaultThinkingLevel: null,
   savedDefaultThinkingLevel: null,
+  fallbackThinkingLevel: null,
+  modelThinkingDefaults: {},
   thinkingLevels: {},
   thinkingLevelMaps: {},
   thinkingLevelPins: {},

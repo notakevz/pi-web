@@ -3,7 +3,7 @@
 import { useState, type ReactNode } from "react";
 import { useIsMobile } from "@/hooks/useIsMobile";
 
-function StarIcon({ filled, size }: { filled: boolean; size: number }) {
+export function StarIcon({ filled, size }: { filled: boolean; size: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
       <polygon points="12 2.5 14.9 8.6 21.5 9.4 16.6 13.9 17.9 20.5 12 17.2 6.1 20.5 7.4 13.9 2.5 9.4 9.1 8.6" />

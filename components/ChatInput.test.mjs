@@ -350,7 +350,7 @@ test("keeps the model selector visible when a model error leaves no options", ()
   assert.match(html, /title="No available models"/);
 });
 
-test("renders the read-only tool preset as the active selection", () => {
+test("renders the read-only wire preset as plan", () => {
   const html = renderToStaticMarkup(
     React.createElement(
       I18nProvider,
@@ -365,11 +365,11 @@ test("renders the read-only tool preset as the active selection", () => {
     ),
   );
 
-  assert.match(html, /title="Change tool preset: read-only"/);
-  assert.match(html, />read-only<\/span>/);
+  assert.match(html, /title="Change tool preset: plan"/);
+  assert.match(html, />plan<\/span>/);
 });
 
-test("renders the empty tool preset as Chat only", () => {
+test("renders the legacy empty tool preset with the compatible build label", () => {
   const html = renderToStaticMarkup(
     React.createElement(
       I18nProvider,
@@ -384,8 +384,70 @@ test("renders the empty tool preset as Chat only", () => {
     ),
   );
 
-  assert.match(html, /title="Change tool preset: Chat only"/);
-  assert.match(html, />Chat only<\/span>/);
+  assert.match(html, /title="Change tool preset: build"/);
+  assert.match(html, />build<\/span>/);
+});
+
+test("defaults the preset button to build and shows full without changing wire IDs", () => {
+  for (const [preset, label] of [[undefined, "build"], ["configured", "build"], ["default", "build"], ["full", "full"]]) {
+    const html = renderToStaticMarkup(React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, onAbort() {}, onToolPresetChange() {}, isStreaming: false, toolPreset: preset,
+    })));
+    assert.ok(html.includes(`title="Change tool preset: ${label}"`));
+  }
+});
+
+test("the actual menu offers only plan/build/full with concise localized descriptions", async () => {
+  const { TOOL_MODE_PRESETS } = await jiti.import("@/lib/tool-presets.ts");
+  const { getLocalePlugin } = await jiti.import("@/lib/i18n/registry.ts");
+  const source = ts.createSourceFile("ChatInput.tsx", readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  function findMenu(node) {
+    if (ts.isCallExpression(node) && node.expression.getText(source) === "TOOL_PRESETS.map") return node.arguments[0];
+    return ts.forEachChild(node, findMenu);
+  }
+  // Exercise the actual rendered menu rows and their click handlers, without
+  // forcing every unrelated composer dropdown open through React internals.
+  const callback = new Script(ts.transpileModule(`(${findMenu(source).getText(source)})`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.React },
+  }).outputText);
+  for (const [locale, descriptions] of [
+    ["en", ["Read only", "Edit & run", "All tools"]],
+    ["zh-CN", ["只读规划", "编辑执行", "全部工具"]],
+    ["zh-TW", ["唯讀規劃", "編輯執行", "全部工具"]],
+  ]) {
+    const selected = [];
+    const row = callback.runInNewContext({
+      React, TOOL_MODE_PRESETS, toolPreset: "none",
+      t: (key) => getLocalePlugin(locale).messages[key],
+      setToolDropdownOpen() {}, onToolPresetChange: (preset) => selected.push(preset),
+    });
+    const modes = Object.keys(TOOL_MODE_PRESETS);
+    assert.deepEqual(modes, ["plan", "build", "full"]);
+    for (const [index, mode] of modes.entries()) {
+      const element = row(mode);
+      const html = renderToStaticMarkup(element);
+      assert.ok(html.includes(`>${mode}</span>`));
+      assert.ok(html.includes(`>${descriptions[index].replaceAll("&", "&amp;")}</span>`));
+      assert.doesNotMatch(html, /Chat only|configured|read-only/);
+      element.props.onClick();
+    }
+    // In particular, clicking build from a legacy none session must enable the
+    // four built-ins explicitly, not be skipped just because its label is build.
+    assert.deepEqual(selected, ["read-only", "default", "full"]);
+  }
+  // The live full loadout contains both shells: it must keep full selected,
+  // leaving the build row clickable rather than incorrectly marking it active.
+  const { getPresetFromTools, PRESET_FULL } = await jiti.import("@/lib/tool-presets.ts");
+  const toolPreset = getPresetFromTools([...PRESET_FULL, "powershell", "codemode"].map((name) => ({
+    name, description: name, active: true,
+  })));
+  const picked = [];
+  const row = callback.runInNewContext({
+    React, TOOL_MODE_PRESETS, toolPreset, t: (key) => getLocalePlugin("en").messages[key],
+    setToolDropdownOpen() {}, onToolPresetChange: (preset) => picked.push(preset),
+  });
+  row("build").props.onClick();
+  assert.deepEqual(picked, ["default"]);
 });
 
 test("renders the compact composer with the standard Send button and no session controls", () => {

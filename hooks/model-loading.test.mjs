@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { Script } from "node:vm";
 import ts from "typescript";
+import { createJiti } from "jiti";
+const { clampSupportedThinkingLevel, modelThinkingDefault } = await createJiti(import.meta.url).import("../lib/model-thinking-defaults.ts");
 
 const source = ts.createSourceFile(
   "useAgentSession.ts",
@@ -37,12 +39,14 @@ function setup(fetchImpl) {
     newSessionCwd: "/project", session: null, isNew: true,
     sessionIdRef: { current: null }, thinkingLevelOverrideRef: { current: null }, newSessionModelOverrideRef: { current: null },
     thinkingLevelPinsRef: { current: {} }, defaultThinkingLevelRef: { current: null },
+    modelThinkingDefaultsRef: { current: {} }, modelThinkingLevelsRef: { current: {} },
+    modelThinkingDefault, clampSupportedThinkingLevel, defaultThinkingLevelFor: (supported) => supported?.includes("medium") ? "medium" : supported?.[0] ?? null,
     asConcreteThinkingLevel: (value) => (!value || value === "auto" ? null : value),
     fetch: fetchImpl,
     MODELS_RETRY_DELAYS_MS: script(schedule.initializer.getText(source)).runInNewContext(),
     delay: async (ms) => { delays.push(ms); },
   };
-  for (const name of ["ModelError", "ModelNames", "ModelScopeWarnings", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "SavedDefaultThinkingLevel", "NewSessionModel"]) {
+  for (const name of ["ModelError", "ModelNames", "ModelScopeWarnings", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "ModelThinkingDefaults", "NewSessionModel", "NewSessionThinkingLevel"]) {
     context[`set${name}`] = (value) => writes.push([name, value]);
   }
   context.loadModels = loadScript.runInNewContext(context);

@@ -1,12 +1,12 @@
 import { stat } from "fs/promises";
-import { resolve } from "path";
+import { join, resolve } from "path";
 import { createAgentSessionServices, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
-  isThinkingLevel,
+  parseDefaultPreferencesEdit,
   projectSettingsPath,
   shadowingProjectKeys,
   writeDefaultPreferences,
-  type DefaultPreferencesEdit,
 } from "@/lib/default-preferences";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
 import { resolveVisibleModels } from "@/lib/model-scope";
@@ -15,27 +15,6 @@ import { invalidateModelsCache } from "@/lib/models-cache";
 import { projectTrustReloadOptions } from "@/lib/project-trust";
 
 export const dynamic = "force-dynamic";
-
-interface DefaultPreferencesRequest {
-  cwd?: unknown;
-  provider?: unknown;
-  modelId?: unknown;
-  thinkingLevel?: unknown;
-}
-
-function parseEdit(body: DefaultPreferencesRequest): DefaultPreferencesEdit | null {
-  const edit: DefaultPreferencesEdit = {};
-  if (body.provider !== undefined || body.modelId !== undefined) {
-    if (typeof body.provider !== "string" || !body.provider) return null;
-    if (typeof body.modelId !== "string" || !body.modelId) return null;
-    edit.model = { provider: body.provider, modelId: body.modelId };
-  }
-  if (body.thinkingLevel !== undefined) {
-    if (!isThinkingLevel(body.thinkingLevel)) return null;
-    edit.thinkingLevel = body.thinkingLevel;
-  }
-  return edit.model || edit.thinkingLevel ? edit : null;
-}
 
 /**
  * Save the model and/or reasoning level new sessions start with.
@@ -46,18 +25,19 @@ function parseEdit(body: DefaultPreferencesRequest): DefaultPreferencesEdit | nu
  * so it goes through the same allow-list as `/api/models`.
  */
 export async function PUT(req: Request) {
-  let body: DefaultPreferencesRequest;
+  let body: unknown;
   try {
-    body = await req.json() as DefaultPreferencesRequest;
+    body = await req.json();
   } catch {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  const edit = parseEdit(body);
+  const edit = parseDefaultPreferencesEdit(body);
   if (!edit) {
-    return Response.json({ error: "Expected provider and modelId, or a valid thinkingLevel" }, { status: 400 });
+    return Response.json({ error: "Expected provider and modelId, a valid thinkingLevel, or a separate modelThinkingLevel { provider, modelId, level } edit" }, { status: 400 });
   }
 
-  const cwd = resolve(typeof body.cwd === "string" && body.cwd ? body.cwd : process.cwd());
+  const requestedCwd = (body as { cwd?: string }).cwd;
+  const cwd = resolve(requestedCwd || process.cwd());
   let cwdStat;
   try {
     cwdStat = await stat(cwd);
@@ -93,22 +73,39 @@ export async function PUT(req: Request) {
       }, { status: 409 });
     }
 
-    if (edit.model) {
+    const target = edit.model ?? edit.modelThinkingLevel;
+    if (target) {
       // Only a model the selector can offer is a default that actually takes
       // effect: startup falls back to the first scoped model otherwise.
       const scope = await resolveVisibleModels(withDeferredProviderModels(services.modelRuntime), settingsManager.getEnabledModels());
-      const { provider, modelId } = edit.model;
-      if (!scope.visible.some((model) => model.provider === provider && model.id === modelId)) {
+      const { provider, modelId } = target;
+      const model = scope.visible.find((model) => model.provider === provider && model.id === modelId);
+      if (!model) {
         return Response.json({ error: `Model not available: ${provider}/${modelId}` }, { status: 404 });
+      }
+      if (edit.modelThinkingLevel) {
+        const { level } = edit.modelThinkingLevel;
+        if (!getSupportedThinkingLevels(model).includes(level)) {
+          return Response.json({ error: `Thinking level not supported for ${provider}/${modelId}: ${level}` }, { status: 400 });
+        }
+        const pinned = scope.thinkingLevelPins[`${provider}/${modelId}`];
+        if (pinned !== undefined && pinned !== level) {
+          return Response.json({
+            error: `enabledModels pins ${provider}/${modelId} to ${pinned}, so this per-model default would not apply at startup.`,
+            reason: "thinking-level-pin",
+            thinkingLevel: pinned,
+          }, { status: 409 });
+        }
       }
     }
 
-    await writeDefaultPreferences(settingsManager, edit);
+    await writeDefaultPreferences(settingsManager, edit, join(agentDir, "settings.json"));
     invalidateModelsCache();
     return Response.json({
       ok: true,
       ...(edit.model ? { defaultModel: edit.model } : {}),
       ...(edit.thinkingLevel ? { defaultThinkingLevel: edit.thinkingLevel } : {}),
+      ...(edit.modelThinkingLevel ? { modelThinkingLevel: edit.modelThinkingLevel } : {}),
     });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });

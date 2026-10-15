@@ -28,6 +28,8 @@ export interface SessionViewSnapshot {
 	/** Summary-format branch tree (no bodies) when the server sent one. */
 	summaryTree?: unknown;
 	thinkingLevel: string;
+	/** Explicit session tool pin; undefined retains the legacy unpinned default. */
+	toolNames?: string[];
 	model: { provider: string; modelId: string } | null;
 	stats?: unknown;
 	totalActiveMs?: number;
@@ -69,17 +71,18 @@ function snapshotBytes(snapshot: SessionViewSnapshot): number {
 	return bytes;
 }
 
-function evictToFit(): void {
+function evictToFit(protectedSessionId?: string | null): void {
 	const store = cache();
+	const oldestEvictable = () => [...store.keys()].find((id) => id !== protectedSessionId);
 	while (store.size > MAX_SESSIONS) {
-		const oldestKey = store.keys().next().value;
+		const oldestKey = oldestEvictable();
 		if (oldestKey === undefined) break;
 		store.delete(oldestKey);
 	}
 	let total = 0;
 	for (const snapshot of store.values()) total += snapshotBytes(snapshot);
 	while (total > MAX_TOTAL_BYTES && store.size > 0) {
-		const oldestKey = store.keys().next().value;
+		const oldestKey = oldestEvictable();
 		if (oldestKey === undefined) break;
 		const removed = store.get(oldestKey);
 		store.delete(oldestKey);
@@ -87,29 +90,42 @@ function evictToFit(): void {
 	}
 }
 
-export function getSessionViewSnapshot(sessionId: string): SessionViewSnapshot | null {
+/** Inspect identity/freshness without letting a background probe change LRU order. */
+export function peekSessionViewSnapshot(sessionId: string): SessionViewSnapshot | null {
 	const snapshot = cache().get(sessionId);
 	if (!snapshot) return null;
 	if (Date.now() - snapshot.savedAt > TTL_MS) {
 		cache().delete(sessionId);
 		return null;
 	}
+	return snapshot;
+}
+
+export function getSessionViewSnapshot(sessionId: string): SessionViewSnapshot | null {
+	const snapshot = peekSessionViewSnapshot(sessionId);
+	if (!snapshot) return null;
 	// LRU touch.
 	cache().delete(sessionId);
 	cache().set(sessionId, snapshot);
 	return snapshot;
 }
 
-/** Store a snapshot; returns false when it was refused (oversize/invalid). */
-export function setSessionViewSnapshot(snapshot: Omit<SessionViewSnapshot, "savedAt">): boolean {
+/** Store a snapshot; background writes may protect the selected session from eviction. */
+export function setSessionViewSnapshot(
+	snapshot: Omit<SessionViewSnapshot, "savedAt">,
+	protectedSessionId?: string | null,
+): boolean {
 	if (!snapshot.sessionId || !snapshot.revision) return false;
 	const store = cache();
-	store.delete(snapshot.sessionId);
 	const entry: SessionViewSnapshot = { ...snapshot, savedAt: Date.now() };
 	const bytes = snapshotBytes(entry);
 	if (bytes > MAX_TOTAL_BYTES) return false;
+	const protectedSnapshot = protectedSessionId && protectedSessionId !== snapshot.sessionId
+		? store.get(protectedSessionId) : undefined;
+	if (protectedSnapshot && bytes + snapshotBytes(protectedSnapshot) > MAX_TOTAL_BYTES) return false;
+	store.delete(snapshot.sessionId);
 	store.set(entry.sessionId, entry);
-	evictToFit();
+	evictToFit(protectedSessionId);
 	return cache().has(entry.sessionId);
 }
 

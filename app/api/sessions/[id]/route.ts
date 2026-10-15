@@ -56,6 +56,23 @@ export async function GET(
     const entries = sm.getEntries();
     const leafId = sm.getLeafId();
     const summaryTree = searchParams.get("tree") === "summary";
+    // Validate background views before projecting the full tree/context/stats.
+    // No force: background reads must never evict or start a runtime wrapper.
+    const latestEntry = entries[entries.length - 1] as { id?: string } | undefined;
+    const snapshotRevision = computeSessionRevision({
+      filePath,
+      sourceId: liveRpc ? `runtime:${String(liveRpc.inner.sessionId)}` : "disk",
+      entryCount: entries.length,
+      latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
+      leafId: leafId ?? null,
+    });
+    if (!force && summaryTree && searchParams.has("deferThinking") && searchParams.has("deferMedia")
+      && !searchParams.has("tail") && snapshotRevision && searchParams.get("knownRevision") === snapshotRevision) {
+      return NextResponse.json(
+        { sessionId: id, snapshotRevision, unchanged: true },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
     const tree = summaryTree
       ? toSummaryTree(projectTreeForResponse(sm.getTree()))
       : projectTreeForResponse(sm.getTree());
@@ -77,17 +94,6 @@ export async function GET(
     // keep monotonic token/cost counters across compaction and page reloads.
     const stats = computeSessionStats(entries as unknown as SessionEntry[]);
     perf?.span("stats");
-    // Opaque freshness token for the session view cache. Derived from the
-    // disk fingerprint and the actual read source; null tells the client the
-    // snapshot is unstable and must not be cached as fresh.
-    const latestEntry = entries[entries.length - 1] as { id?: string } | undefined;
-    const snapshotRevision = computeSessionRevision({
-      filePath,
-      sourceId: liveRpc ? `runtime:${String(liveRpc.inner.sessionId)}` : "disk",
-      entryCount: entries.length,
-      latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
-      leafId: leafId ?? null,
-    });
     const sessionName = sm.getSessionName();
     const firstUserEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
     const firstUserMessage = firstUserEntry?.type === "message" ? firstUserEntry.message : undefined;

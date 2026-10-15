@@ -22,8 +22,8 @@ import {
   snapshotCoversLoadedEntries,
 } from "@/lib/session-view-cache";
 import { clearDraft, getDraft, rekeyDraft, restoreDraftSubmission } from "@/lib/draft-store";
-import { getPreferredToolPreset, setPreferredToolPreset } from "@/lib/tool-preset-preference";
-import { CONFIGURED_TOOL_PRESET, getPresetFromToolNames, getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
+import { DEFAULT_TOOL_PRESET, NEW_SESSION_TOOL_PRESET, getPresetFromToolNames, getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
+import { clampSupportedThinkingLevel, modelThinkingDefault } from "@/lib/model-thinking-defaults";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { userMessageKey } from "@/lib/prompt-recovery";
@@ -207,8 +207,8 @@ type ConcreteThinkingLevel = Exclude<ThinkingLevelOption, "auto">;
 /**
  * What a fresh composer was told to use instead of the automatic choice. The
  * bar above it moves the composer to another folder by remounting it; these
- * go along with the draft. (The tool preset needs no carrying: a pick is the
- * browser's preference, which every fresh composer starts from.)
+ * go along with the draft. Tool modes are session-scoped: every new composer
+ * starts in full, independent of old browser preferences.
  */
 export interface NewSessionChoices {
   model: { provider: string; modelId: string } | null;
@@ -218,6 +218,15 @@ export interface NewSessionChoices {
 function asConcreteThinkingLevel(value?: string | null): ConcreteThinkingLevel | null {
   if (!value || value === "auto") return null;
   return value as ConcreteThinkingLevel;
+}
+
+/** Preferred concrete level when pi has no explicit default: pick a middle level the model supports. */
+export function defaultThinkingLevelFor(supported?: string[] | null): ConcreteThinkingLevel | null {
+  if (!supported || supported.length === 0) return null;
+  for (const want of ["medium", "high", "low", "minimal", "off"] as const) {
+    if (supported.includes(want)) return want;
+  }
+  return supported[supported.length - 1] as ConcreteThinkingLevel;
 }
 
 // Session id -> user entry being edited. ChatWindow remounts per session, so a
@@ -319,13 +328,15 @@ export interface AttachedImage {
 }
 
 type SelectedModel = { provider: string; modelId: string };
-type ModelEntry = { id: string; name: string; provider: string };
+type ModelEntry = { id: string; name: string; provider: string; thinkingToggle?: boolean };
 type ModelsResponse = {
   models: Record<string, string>;
   modelList?: ModelEntry[];
   defaultModel?: SelectedModel | null;
   defaultThinkingLevel?: string | null;
   savedDefaultThinkingLevel?: string | null;
+  modelThinkingDefaults?: Record<string, string>;
+  fallbackThinkingLevel?: string | null;
   thinkingLevels?: Record<string, string[]>;
   thinkingLevelMaps?: Record<string, Record<string, string | null>>;
   thinkingLevelPins?: Record<string, string>;
@@ -371,10 +382,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [modelThinkingLevelMaps, setModelThinkingLevelMaps] = useState<Record<string, Record<string, string | null>>>({});
   const [newSessionModel, setNewSessionModel] = useState<SelectedModel | null>(() => initialChoices?.model ?? null);
   const [newSessionDefaultModel, setNewSessionDefaultModel] = useState<SelectedModel | null>(null);
-  const [toolPreset, setToolPreset] = useState<ToolPreset>(CONFIGURED_TOOL_PRESET);
+  const [toolPreset, setToolPreset] = useState<ToolPreset>(isNew ? NEW_SESSION_TOOL_PRESET : DEFAULT_TOOL_PRESET);
   const [newSessionThinkingLevel, setNewSessionThinkingLevel] = useState<ConcreteThinkingLevel | null>(() => initialChoices?.thinkingLevel ?? null);
   const [newSessionDefaultThinkingLevel, setNewSessionDefaultThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
-  const [savedDefaultThinkingLevel, setSavedDefaultThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
+  const [modelThinkingDefaults, setModelThinkingDefaults] = useState<Record<string, string>>({});
   const [currentThinkingOverride, setCurrentThinkingOverride] = useState<ConcreteThinkingLevel | null>(null);
   const [liveThinkingLevel, setLiveThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
   const [retryInfo, setRetryInfo] = useState<{ attempt: number; maxAttempts: number; errorMessage?: string } | null>(null);
@@ -412,9 +423,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventStreamGraceActiveRef = useRef(false);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
   const sessionPropIdRef = useRef<string | null>(session?.id ?? null);
-  // False while the session carries no tool selection of its own, so its loadout
-  // follows settings.json defaultTools and the picker must say so rather than
-  // labelling it with whichever preset the resolved tools happen to match.
+  // An ordinary session without a pin uses build, regardless of the browser's
+  // preference for fresh composers or whichever tools settings.json names.
   const sessionToolsPinnedRef = useRef(false);
   const agentRunningRef = useRef(false);
   const sdkAgentActiveRef = useRef(false);
@@ -445,14 +455,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const newSessionModelOverrideRef = useRef<SelectedModel | null>(initialChoices?.model ?? null);
   const thinkingLevelOverrideRef = useRef<ConcreteThinkingLevel | null>(initialChoices?.thinkingLevel ?? null);
   const thinkingLevelPinsRef = useRef<Record<string, string>>({});
+  const modelThinkingDefaultsRef = useRef<Record<string, string>>({});
+  const modelThinkingLevelsRef = useRef<Record<string, string[]>>({});
+  const displayModelRef = useRef<SelectedModel | null>(null);
   const defaultThinkingLevelRef = useRef<ConcreteThinkingLevel | null>(null);
   const promptRunIdRef = useRef(0);
   const optimisticUserMessageKeyRef = useRef<string | null>(null);
   const modelSwitchPendingRef = useRef(false);
+  const modelSwitchFlightRef = useRef<Promise<boolean> | null>(null);
   const draftKeyAliasesRef = useRef(new Map<string, string>());
   const sessionHookMountedRef = useRef(true);
+  const sessionMountGenerationRef = useRef(0);
   // In-flight session reads, keyed by session id (or force:<id> for fresh reads).
   const loadFlightsRef = useRef(new Map<string, Promise<unknown>>());
+  const sessionReadIdRef = useRef(0);
+  const sessionReadAppliedIdRef = useRef(0);
+  // Confirmed model/effort writes invalidate views started before that write,
+  // even if the subsequent canonical read fails and advances no applied ID.
+  const sessionSettingsReadFloorRef = useRef(0);
   // Latest settled view state, readable from the unmount cleanup without
   // re-subscribing it. Assigned every render like sessionPropIdRef below.
   const dataRef = useRef<SessionData | null>(null);
@@ -471,6 +491,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   historyCursorRef.current = historyCursor;
   hasEarlierMessagesRef.current = hasEarlierMessages;
   earlierTurnCountRef.current = earlierTurnCount;
+
+  // A previous mount's foreground read must not overwrite the snapshot a
+  // background completion (or a Strict Mode remount) has refreshed meanwhile.
+  useLayoutEffect(() => {
+    sessionHookMountedRef.current = true;
+    const generation = ++sessionMountGenerationRef.current;
+    const flights = loadFlightsRef.current;
+    return () => {
+      sessionHookMountedRef.current = false;
+      sessionMountGenerationRef.current = generation + 1;
+      flights.clear();
+    };
+  }, []);
 
   if (!eventConnectionRef.current) {
     eventConnectionRef.current = new AgentEventConnection({
@@ -497,8 +530,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const existingSessionId = session?.id;
 
   useLayoutEffect(() => {
-    if (!existingSessionId && (!isNew || sessionIdRef.current)) return;
-    setToolPresetState(getPreferredToolPreset());
+    if (existingSessionId || !isNew || sessionIdRef.current) return;
+    setToolPresetState(NEW_SESSION_TOOL_PRESET);
   }, [existingSessionId, isNew, setToolPresetState]);
 
   const onNewSessionChoicesChange = opts.onNewSessionChoicesChange;
@@ -521,6 +554,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const displayModel = isNew
     ? (newSessionModel ?? newSessionDefaultModel)
     : currentModel ?? (data?.context.messages.length === 0 ? newSessionDefaultModel : null);
+  displayModelRef.current = displayModel;
+  const savedDefaultThinkingLevel = displayModel
+    ? asConcreteThinkingLevel(modelThinkingDefaults[`${displayModel.provider}/${displayModel.modelId}`])
+    : null;
   const contextThinkingLevel = asConcreteThinkingLevel(
     data?.context.thinkingLevel && data.context.thinkingLevel !== "off"
       ? data.context.thinkingLevel
@@ -635,12 +672,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [applyContextUsage]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
-    // Single-flight: concurrent reads for the same session (mount + SSE settle +
-    // reconcile) share one request unless the caller forces a fresh read.
+  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean; fresh?: boolean }) => {
+    // Single-flight: ordinary reads share a request. A model switch needs a
+    // post-write read, not a pre-switch flight; fresh bypasses client dedupe
+    // without force=1's runtime eviction probe.
     const flightKey = options?.force ? `force:${sid}` : sid;
-    const inflight = options?.force ? undefined : loadFlightsRef.current.get(flightKey);
+    const inflight = options?.force || options?.fresh ? undefined : loadFlightsRef.current.get(flightKey);
     if (inflight) return await inflight;
+    const generation = sessionMountGenerationRef.current;
+    const requestId = ++sessionReadIdRef.current;
+    const isCurrent = () => sessionHookMountedRef.current && sessionIdRef.current === sid
+      && sessionMountGenerationRef.current === generation && requestId >= sessionReadAppliedIdRef.current
+      && requestId > sessionSettingsReadFloorRef.current;
+    if (!isCurrent()) return null;
   const flight = (async (): Promise<unknown> => {
     let messagesLoaded = false;
     try {
@@ -648,7 +692,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", tree: "summary" });
       if (options?.force) params.set("force", "1");
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
+      if (!isCurrent()) return null;
       if (res.status === 404) {
+        sessionReadAppliedIdRef.current = requestId;
         if (showLoading) {
           setData(null);
           setActiveLeafId(null);
@@ -659,12 +705,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setEarlierTurnCount(0);
           setError(null);
         }
+        setLoading(false);
         deleteSessionViewSnapshot(sid);
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
+      if (!isCurrent()) return null;
       // Freshness check: when the disk snapshot is unchanged (same opaque
       // revision), keep any history the user already paged in instead of
       // collapsing back to the fresh 50-entry window. The state hooks then
@@ -676,6 +723,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         && cached.entryIds.length >= (d.context.entryIds ?? []).length,
       );
       const persistedMessages = revisionUnchanged ? messagesRef.current : d.context.messages;
+      // Late pre-switch history/state replies cannot undo this newer view.
+      // A failed newer read never advances this marker or discards a good one.
+      sessionReadAppliedIdRef.current = requestId;
       setData(revisionUnchanged
         ? {
             ...d,
@@ -704,6 +754,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           turnsBefore: earlierTurnCountRef.current,
           summaryTree: d.tree,
           thinkingLevel: d.context.thinkingLevel,
+          toolNames: d.toolNames,
           model: d.context.model,
           stats: d.stats,
           totalActiveMs: d.totalActiveMs,
@@ -719,11 +770,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // Tool-preset state is independent of the view cache: it must be applied
       // on every read, cached window or not (#700).
       sessionToolsPinnedRef.current = d.toolNames !== undefined;
-      setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : CONFIGURED_TOOL_PRESET);
-      setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
-      setCurrentThinkingOverride(null);
+      setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : DEFAULT_TOOL_PRESET);
+      // Check now, not inside a queued React updater: the pending ref can
+      // change before a batched render processes it. A reload during a switch
+      // must preserve both the target model and a newer explicit effort pick.
+      if (!modelSwitchPendingRef.current) {
+        setCurrentModelOverride(null);
+        setCurrentThinkingOverride(null);
+      }
       setError(null);
-      if (d.treeFormat === "summary" && d.snapshotRevision) {
+      if (!revisionUnchanged && d.treeFormat === "summary" && d.snapshotRevision) {
         setSessionViewSnapshot({
           sessionId: sid,
           revision: d.snapshotRevision,
@@ -735,6 +791,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           turnsBefore: d.context.turnsBefore ?? 0,
           summaryTree: d.tree,
           thinkingLevel: d.context.thinkingLevel,
+          toolNames: d.toolNames,
           model: d.context.model,
           stats: d.stats,
           totalActiveMs: d.totalActiveMs,
@@ -750,7 +807,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
 
       messagesLoaded = true;
-      if (showLoading) setLoading(false);
+      setLoading(false);
       if (!includeState) return null;
 
       try {
@@ -759,7 +816,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (sessionIdRef.current !== sid) return null;
+        if (!isCurrent()) return null;
 
         const liveState = agentState.state;
         syncLiveModel(liveState);
@@ -779,10 +836,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
     } catch (e) {
-      setError(String(e));
+      if (isCurrent()) setError(String(e));
       return "error";
     } finally {
-      if (showLoading && !messagesLoaded) setLoading(false);
+      if (isCurrent() && showLoading && !messagesLoaded) setLoading(false);
     }
     })();
     if (!options?.force) loadFlightsRef.current.set(flightKey, flight);
@@ -839,7 +896,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const tools = await sendAgentCommand<ToolEntry[]>(sid, { type: "get_tools" });
       if (!tools || !sessionHookMountedRef.current || sessionIdRef.current !== sid) return null;
       const { getPresetFromTools } = await import("@/lib/tool-presets");
-      setToolPresetState(sessionToolsPinnedRef.current ? getPresetFromTools(tools) : CONFIGURED_TOOL_PRESET);
+      setToolPresetState(sessionToolsPinnedRef.current ? getPresetFromTools(tools) : DEFAULT_TOOL_PRESET);
       onSystemToolsChange?.(tools);
       return tools;
     } catch (e) {
@@ -884,8 +941,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const selectedModel = newSessionModelOverrideRef.current;
       const selectedThinkingLevel = thinkingLevelOverrideRef.current;
       if (selectedModel) setPendingModel(selectedModel);
-      // Undefined means the user never overrode the loadout: omit the field entirely
-      // so pi resolves settings.json defaultTools instead of being pinned to ours (#700).
+      // Fresh composers send full's complete builtin set explicitly. A user can
+      // change this chat's mode, but no browser preference changes the next one.
       const toolNames = getToolNamesForPreset(toolPreset);
       sessionToolsPinnedRef.current = toolNames !== undefined;
       const res = await fetch("/api/agent/new", {
@@ -920,6 +977,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (
         result.thinkingLevel
+        && newSessionModelOverrideRef.current === selectedModel
         && thinkingLevelOverrideRef.current === selectedThinkingLevel
       ) {
         setLiveThinkingLevel(asConcreteThinkingLevel(result.thinkingLevel));
@@ -1771,17 +1829,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
     try {
       if (isNew && newSessionCwd) {
-        const selectedModel = newSessionModel;
-        const existingSid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
-        const sid = existingSid ?? await ensureNewSession();
+        const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current ?? await ensureNewSession();
 
         if (!sid) throw new Error("Unable to create a session for the prompt");
         sentSessionId = sid;
-        if (selectedModel) {
-          setPendingModel(selectedModel);
-          if (existingSid) {
-            await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
-          }
+        // A selection made while creation was pending owns the final model and
+        // effort. Do not repeat set_model: stale SDK defaults would undo it.
+        if (await modelSwitchFlightRef.current === false) {
+          throw new Error("Model switch failed; please select the model again before sending.");
         }
         // Switching sessions unmounts this composer and closes its stream. The
         // prompt still goes out, so the new session runs and gets its sidebar
@@ -1800,6 +1855,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         promoteNewSession(1, message);
       } else if (session) {
         sentSessionId = session.id;
+        if (await modelSwitchFlightRef.current === false) {
+          throw new Error("Model switch failed; please select the model again before sending.");
+        }
         await ensureEventsConnected(session.id);
         promptRequestStarted = true;
         await sendAgentCommand(session.id, {
@@ -1846,7 +1904,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit]);
+  }, [isNew, newSessionCwd, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit]);
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
     if (agentRunningRef.current || bashRunningRef.current) return;
@@ -1950,56 +2008,120 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [isCompacting, loadContext]);
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
+    if (modelSwitchPendingRef.current) return;
+    if (displayModelRef.current?.provider === provider && displayModelRef.current?.modelId === modelId) return;
+    const target = { provider, modelId };
+    const supported = modelThinkingLevelsRef.current[`${provider}:${modelId}`];
+    const preferred = modelThinkingDefault(target, thinkingLevelPinsRef.current,
+      modelThinkingDefaultsRef.current, defaultThinkingLevelRef.current, supported)
+      ?? clampSupportedThinkingLevel("medium", supported);
     if (isNew) {
       const selectedModel = { provider, modelId };
       newSessionModelOverrideRef.current = selectedModel;
       setNewSessionModel(selectedModel);
       setPendingModel(selectedModel);
-      if (thinkingLevelOverrideRef.current === null) {
-        const pinned = thinkingLevelPinsRef.current[`${provider}/${modelId}`];
-        setNewSessionDefaultThinkingLevel(
-          asConcreteThinkingLevel(pinned) ?? defaultThinkingLevelRef.current,
-        );
-      }
-      const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
-      if (!sid) return;
+      displayModelRef.current = selectedModel;
+      // A one-off effort belongs to the previous model, not the next pick.
+      thinkingLevelOverrideRef.current = null;
+      setNewSessionThinkingLevel(null);
+      setNewSessionDefaultThinkingLevel(preferred);
+      modelSwitchPendingRef.current = true;
+      setModelSwitching(true);
+      const flight = (async () => {
+        const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
+        if (!sid) return true;
+        try {
+          await sendAgentCommand(sid, { type: "set_model", provider, modelId });
+          sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
+          await sendAgentCommand(sid, { type: "set_thinking_level", level: preferred });
+          sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
+          if (sessionHookMountedRef.current && sessionIdRef.current === sid) {
+            setLiveModel(target);
+            setLiveThinkingLevel(preferred);
+            setNewSessionDefaultThinkingLevel(preferred);
+          }
+          return true;
+        } catch (e) {
+          console.error("Failed to set model:", e);
+          addNotice({ type: "error", message: `Failed to switch model: ${e instanceof Error ? e.message : String(e)}` });
+          // A dropped response may follow a successful server write. Restore
+          // the actual model/effort rather than leave a fictional selection.
+          try {
+            const state = await sendAgentCommand<AgentStateResponse>(sid, { type: "get_state" });
+            if (sessionHookMountedRef.current && sessionIdRef.current === sid && state.model) {
+              const actual = { provider: state.model.provider, modelId: state.model.id };
+              newSessionModelOverrideRef.current = actual;
+              displayModelRef.current = actual;
+              setNewSessionModel(actual);
+              setPendingModel(actual);
+              syncLiveModel(state);
+              setNewSessionDefaultThinkingLevel(asConcreteThinkingLevel(state.thinkingLevel));
+            }
+          } catch { /* The error notice stays visible if reconciliation also fails. */ }
+          return false;
+        }
+      })();
+      modelSwitchFlightRef.current = flight;
       try {
-        await sendAgentCommand(sid, { type: "set_model", provider, modelId });
-      } catch (e) {
-        console.error("Failed to set model:", e);
+        await flight;
+      } finally {
+        if (modelSwitchFlightRef.current === flight) modelSwitchFlightRef.current = null;
+        modelSwitchPendingRef.current = false;
+        setModelSwitching(false);
       }
       return;
     }
     const sid = sessionIdRef.current;
-    if (!sid || modelSwitchPendingRef.current) return;
-    const target = { provider, modelId };
+    if (!sid) return;
     const previousOverride = currentModelOverride;
     modelSwitchPendingRef.current = true;
     setCurrentModelOverride(target);
+    displayModelRef.current = target;
+    // Publish the target model and its resolved effort in the same render,
+    // never briefly inheriting the previous model's level or medium fallback.
+    setCurrentThinkingOverride(preferred);
     setModelSwitching(true);
+    const flight = (async () => {
+      try {
+        const selected = await sendAgentCommand<{ provider: string; id: string }>(sid, { type: "set_model", provider, modelId });
+        sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
+        setLiveModel({ provider: selected.provider, modelId: selected.id });
+        // A running wrapper can still hold settings from before a star save.
+        // This RPC returns null, not the level; preferred is already SDK-clamped.
+        await sendAgentCommand(sid, { type: "set_thinking_level", level: preferred });
+        sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
+        setLiveThinkingLevel(preferred);
+        // Keep the flight active through canonical reload: later effort picks
+        // wait for both model and default to settle, then override that default.
+        await loadSession(sid, false, false, { fresh: true });
+        setCurrentModelOverride(null);
+        // An explicit effort selected during the flight owns its optimistic
+        // value until its own RPC completes; do not flash the default again.
+        setCurrentThinkingOverride((current) => current === preferred ? null : current);
+        return true;
+      } catch (e) {
+        console.error("Failed to set model:", e);
+        setCurrentModelOverride(previousOverride);
+        setCurrentThinkingOverride(null);
+        addNotice({
+          type: "error",
+          message: `Failed to switch model: ${e instanceof Error ? e.message : String(e)}`,
+        });
+        // A failed response may follow a server write; do not join a read
+        // started before that write when reconciling the actual state.
+        await loadSession(sid, false, true, { fresh: true });
+        return false;
+      }
+    })();
+    modelSwitchFlightRef.current = flight;
     try {
-      const selected = await sendAgentCommand<{ provider: string; id: string }>(sid, { type: "set_model", provider, modelId });
-      setLiveModel({ provider: selected.provider, modelId: selected.id });
-      // Pi persists model_change synchronously. Reload the canonical session so
-      // the model, thinking level, and active leaf all advance together.
-      modelSwitchPendingRef.current = false;
-      await loadSession(sid);
-    } catch (e) {
-      console.error("Failed to set model:", e);
-      modelSwitchPendingRef.current = false;
-      setCurrentModelOverride(previousOverride);
-      addNotice({
-        type: "error",
-        message: `Failed to switch model: ${e instanceof Error ? e.message : String(e)}`,
-      });
-      // A failed response can still follow a server-side write (for example, a
-      // dropped connection), so let the session file settle the displayed model.
-      await loadSession(sid, false, true);
+      await flight;
     } finally {
+      if (modelSwitchFlightRef.current === flight) modelSwitchFlightRef.current = null;
       modelSwitchPendingRef.current = false;
       setModelSwitching(false);
     }
-  }, [addNotice, currentModelOverride, isNew, loadSession, setNewSessionModel]);
+  }, [addNotice, currentModelOverride, isNew, loadSession, setNewSessionModel, syncLiveModel]);
 
   const handleCompact = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -2052,7 +2174,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setModelNames(d.models);
     setModelError(d.modelError ?? null);
     setModelScopeWarnings(d.modelScopeWarnings ?? []);
-    setModelThinkingLevels(d.thinkingLevels ?? {});
+    modelThinkingLevelsRef.current = d.thinkingLevels ?? {};
+    setModelThinkingLevels(modelThinkingLevelsRef.current);
     setModelThinkingLevelMaps(d.thinkingLevelMaps ?? {});
     const nextModelList = d.modelList ?? [];
     setModelList(nextModelList);
@@ -2063,8 +2186,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ? { provider: displayDefaultModel.provider, modelId: displayDefaultModel.id }
       : null);
     thinkingLevelPinsRef.current = d.thinkingLevelPins ?? {};
-    defaultThinkingLevelRef.current = asConcreteThinkingLevel(d.defaultThinkingLevel);
-    setSavedDefaultThinkingLevel(asConcreteThinkingLevel(d.savedDefaultThinkingLevel));
+    modelThinkingDefaultsRef.current = d.modelThinkingDefaults ?? {};
+    setModelThinkingDefaults(modelThinkingDefaultsRef.current);
+    // The resolved startup default belongs to the default model, not every model.
+    defaultThinkingLevelRef.current = asConcreteThinkingLevel(d.fallbackThinkingLevel !== undefined
+      ? d.fallbackThinkingLevel
+      : d.savedDefaultThinkingLevel ?? (d.modelThinkingDefaults === undefined ? d.defaultThinkingLevel : null));
     if (isNew && !sessionIdRef.current) {
       // A picked model this folder does not offer (one carried over from the
       // composer this one replaced, or since scoped out) goes back to automatic.
@@ -2076,25 +2203,28 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (picked && !kept) {
         newSessionModelOverrideRef.current = null;
         setNewSessionModel(null);
+        thinkingLevelOverrideRef.current = null;
+        setNewSessionThinkingLevel(null);
       }
       // The first listed model is not necessarily the runtime's automatic choice.
       // An `enabledModels` pattern may pin a thinking level (`anthropic/*:high`).
       // Like pi, apply it to the model a new session starts with.
       const startModel = kept ? picked : displayDefaultModel && { provider: displayDefaultModel.provider, modelId: displayDefaultModel.id };
-      const pinned = startModel && d.thinkingLevelPins?.[`${startModel.provider}/${startModel.modelId}`];
       if (thinkingLevelOverrideRef.current === null) {
-        setNewSessionDefaultThinkingLevel(
-          asConcreteThinkingLevel(pinned) ?? defaultThinkingLevelRef.current,
-        );
+        const supported = startModel ? d.thinkingLevels?.[`${startModel.provider}:${startModel.modelId}`] : undefined;
+        setNewSessionDefaultThinkingLevel(startModel
+          ? modelThinkingDefault(startModel, thinkingLevelPinsRef.current, modelThinkingDefaultsRef.current,
+            defaultThinkingLevelRef.current, supported) ?? clampSupportedThinkingLevel("medium", supported)
+          : null);
       }
     }
   }, [isNew, newSessionCwd, session?.cwd]);
 
   // Picking a model or reasoning level is session-scoped, as in the TUI. The
   // selectors' star is the explicit Ctrl+S equivalent: it saves the global
-  // default new sessions start with and also selects it for this chat.
+  // model for new chats or this model's reasoning level, and selects it here.
   const saveDefaultPreferences = useCallback(async (
-    edit: { provider: string; modelId: string } | { thinkingLevel: ConcreteThinkingLevel },
+    edit: { provider: string; modelId: string } | { modelThinkingLevel: SelectedModel & { level: ConcreteThinkingLevel } },
   ) => {
     const cwd = newSessionCwd ?? session?.cwd;
     const res = await fetch("/api/models/default", {
@@ -2365,11 +2495,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } else {
       setCurrentThinkingOverride(level);
     }
+    if (await modelSwitchFlightRef.current === false) return;
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
       await sendAgentCommand(sid, { type: "set_thinking_level", level });
       if (sessionHookMountedRef.current && sessionIdRef.current === sid) {
+        sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
         setLiveThinkingLevel(level);
         setCurrentThinkingOverride(null);
       }
@@ -2380,21 +2512,25 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [isNew]);
 
   const handleSetDefaultThinkingLevel = useCallback(async (level: ConcreteThinkingLevel) => {
+    const target = displayModelRef.current;
+    if (!target) return;
     try {
-      await saveDefaultPreferences({ thinkingLevel: level });
+      await saveDefaultPreferences({ modelThinkingLevel: { ...target, level } });
     } catch (e) {
       addNotice({ type: "error", message: `Failed to save default reasoning level: ${e instanceof Error ? e.message : String(e)}` });
       return;
     }
-    addNotice({ type: "success", message: `Default reasoning level: ${level}` });
-    setSavedDefaultThinkingLevel(level);
-    if (displayThinkingLevel !== level) await handleThinkingLevelChange(level);
+    addNotice({ type: "success", message: `Default reasoning for ${target.provider}/${target.modelId}: ${level}` });
+    modelThinkingDefaultsRef.current = { ...modelThinkingDefaultsRef.current, [`${target.provider}/${target.modelId}`]: level };
+    setModelThinkingDefaults(modelThinkingDefaultsRef.current);
+    // Saving A while switching to B must never apply A's effort to B.
+    if (sessionHookMountedRef.current && displayModelRef.current?.provider === target.provider && displayModelRef.current?.modelId === target.modelId
+      && displayThinkingLevel !== level) await handleThinkingLevelChange(level);
     reloadModelsQuietly();
   }, [addNotice, displayThinkingLevel, handleThinkingLevelChange, reloadModelsQuietly, saveDefaultPreferences]);
 
   const handleToolPresetChange = useCallback(async (preset: ToolPreset) => {
     const toolNames = getToolNamesForPreset(preset);
-    setPreferredToolPreset(preset);
     setToolPresetState(preset);
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) {
@@ -2402,8 +2538,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       return;
     }
     try {
-      // Omitting toolNames retracts the session's pin so it follows the configured
-      // defaults again; the server rebuilds the session to resolve them.
+      // Legacy configured retracts the pin; ordinary unpinned sessions use build.
+      // An empty list remains Chat only and still crosses the rebuild boundary.
       const result = await sendAgentCommand<{ sessionId?: string; recreated?: boolean }>(sid, {
         type: "set_tools",
         ...(toolNames !== undefined ? { toolNames } : {}),
@@ -2519,9 +2655,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // run state — and the background read remains authoritative.
       const cached = getSessionViewSnapshot(session.id);
       if (cached) {
+        // Prime refs as well as queued React state: a fast freshness reply can
+        // arrive before the cached paint commits. It must preserve this window.
+        messagesRef.current = cached.messages;
+        entryIdsRef.current = cached.entryIds;
+        activeLeafIdRef.current = cached.leafId;
+        historyCursorRef.current = cached.oldestEntryId;
+        hasEarlierMessagesRef.current = cached.hasMore;
+        earlierTurnCountRef.current = cached.turnsBefore;
+        sessionToolsPinnedRef.current = cached.toolNames !== undefined;
+        setToolPresetState(cached.toolNames !== undefined ? getPresetFromToolNames(cached.toolNames) : DEFAULT_TOOL_PRESET);
         setData({
           sessionId: session.id,
           filePath: "",
+          snapshotRevision: cached.revision,
+          treeFormat: "summary",
+          toolNames: cached.toolNames,
           totalActiveMs: cached.totalActiveMs ?? 0,
           tree: cached.summaryTree as SessionData["tree"],
           leafId: cached.leafId,
@@ -2606,6 +2755,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             turnsBefore: earlierTurnCountRef.current,
             summaryTree: currentData.tree,
             thinkingLevel: currentData.context.thinkingLevel,
+            toolNames: currentData.toolNames,
             model: currentData.context.model,
             stats: currentData.stats,
             totalActiveMs: currentData.totalActiveMs,
@@ -2744,7 +2894,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setSessionStatsOverride(null);
   }, [messages.length, contextUsage?.tokens, contextUsage?.percent, contextUsage?.contextWindow]);
 
-  const thinkingLevel: ThinkingLevelOption = displayThinkingLevel ?? "auto";
+  const displayModelSupported = displayModel
+    ? modelThinkingLevels[`${displayModel.provider}:${displayModel.modelId}`]
+    : undefined;
+  const thinkingLevel: ThinkingLevelOption =
+    displayThinkingLevel ?? defaultThinkingLevelFor(displayModelSupported) ?? "auto";
   // The head of each queue is on screen; the rest wait behind it.
   const extensionDialog = extensionDialogs[0] ?? null;
   const waitingExtensionDialogCount = Math.max(0, extensionDialogs.length - 1);

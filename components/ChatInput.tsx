@@ -1,7 +1,7 @@
 "use client";
 
 import React, { memo, useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
-import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
+import { defaultThinkingLevelFor, type BuiltinSlashCommandResult, type CompactResultInfo, type QueuedMessages, type SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { TextContent, UserMessage } from "@/lib/types";
 import {
@@ -32,8 +32,9 @@ import { useEnterSendMode } from "@/hooks/useEnterSendMode";
 import { useI18n } from "@/hooks/useI18n";
 import { useChatAppearance } from "@/hooks/useChatAppearance";
 import { useFontPreferences } from "@/hooks/useFontPreferences";
-import type { ToolPreset } from "@/lib/tool-presets";
+import { getToolModeLabel, TOOL_MODE_PRESETS, type ToolMode, type ToolPreset } from "@/lib/tool-presets";
 import { SelectorRow } from "./SelectorRow";
+import { thinkingControlState, type ThinkingControlLevel } from "@/lib/thinking-controls";
 import { ModelSelector, type ModelSelectorOption } from "./ModelSelector";
 
 export { filterModelOptions } from "./ModelSelector";
@@ -56,7 +57,7 @@ interface Props {
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
-  modelList?: { id: string; name: string; provider: string; input?: string[] }[];
+  modelList?: { id: string; name: string; provider: string; input?: string[]; thinkingToggle?: boolean }[];
   modelError?: string | null;
   /** Diagnostics from resolving `enabledModels`, e.g. a pattern that matched nothing. */
   modelScopeWarnings?: string[];
@@ -80,9 +81,9 @@ interface Props {
   onThinkingLevelChange?: (level: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => void;
   availableThinkingLevels?: string[] | null;
   thinkingLevelMap?: Record<string, string | null> | null;
-  /** `defaultThinkingLevel` saved in settings, starred in the reasoning menu. */
+  /** This exact provider/model's saved reasoning default, starred in the menu. */
   savedDefaultThinkingLevel?: string | null;
-  /** Saves a reasoning level as the default for new sessions and selects it here. */
+  /** Saves this model's reasoning default (without changing the new-chat model) and selects it here. */
   onSetDefaultThinkingLevel?: (level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => void;
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage?: string } | null;
   queuedMessages?: QueuedMessages | null;
@@ -112,16 +113,8 @@ export interface ChatInputHandle {
   restoreSubmission: (text: string, images?: ChatDraftImage[], targetDraftKey?: string) => void;
 }
 
-// "configured" sends no override, so the session follows settings.json defaultTools.
-const TOOL_PRESETS = ["configured", "chat-only", "read-only", "default", "full"] as const;
-type ToolPresetLabel = typeof TOOL_PRESETS[number];
-const TOOL_PRESET_MAP: Record<ToolPresetLabel, ToolPreset> = {
-  configured: "configured",
-  "chat-only": "none",
-  "read-only": "read-only",
-  default: "default",
-  full: "full",
-};
+// Display names do not change persisted/wire IDs; legacy states are not menu choices.
+const TOOL_PRESETS = Object.keys(TOOL_MODE_PRESETS) as ToolMode[];
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
 const TEXT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 const ANCHORED_MENU_GAP = 8;
@@ -260,9 +253,8 @@ function subscribeUpwardMenuMaxHeight(
   };
 }
 
-const THINKING_LEVELS = ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const THINKING_LEVEL_DESC_KEYS: Record<typeof THINKING_LEVELS[number], string> = {
-  auto: "chat.thinkingUseDefault", off: "chat.thinkingOff", minimal: "chat.thinkingMinimal", low: "chat.thinkingLow",
+const THINKING_LEVEL_DESC_KEYS: Record<ThinkingControlLevel, string> = {
+  off: "chat.thinkingOff", minimal: "chat.thinkingMinimal", low: "chat.thinkingLow",
   medium: "chat.thinkingMedium", high: "chat.thinkingHigh", xhigh: "chat.thinkingXhigh", max: "chat.thinkingMax",
 };
 
@@ -1656,13 +1648,26 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     ? `${compactResult.reason && compactResult.reason !== "manual" ? `${compactResult.reason[0].toUpperCase()}${compactResult.reason.slice(1)} ` : t("chat.compacted")} ${formatTokenCount(compactResult.tokensBefore)} -> ${formatTokenCount(compactResult.estimatedTokensAfter)} tokens (${t("chat.tokensSaved", { saved: formatTokenCount(compactSavedTokens) })})`
     : null;
   const resolvedThinkingLevel = thinkingLevel && thinkingLevel !== "auto" ? thinkingLevel : null;
-  const thinkingDisplayLabel = (() => {
-    const lvl = resolvedThinkingLevel ?? "auto";
-    if (lvl === "auto" || !thinkingLevelMap) return lvl;
-    return thinkingLevelMap[lvl] ?? lvl;
-  })();
-  const rawToolPresetLabel = Object.entries(TOOL_PRESET_MAP).find(([, v]) => v === (toolPreset ?? "configured"))?.[0] ?? "configured";
-  const toolPresetLabel = rawToolPresetLabel === "chat-only" ? t("chat.chatOnly") : rawToolPresetLabel;
+  const effectiveThinkingLevel = resolvedThinkingLevel ?? defaultThinkingLevelFor(availableThinkingLevels) ?? null;
+  const toggleSupported = modelList?.find((entry) => entry.provider === model?.provider && entry.id === model?.modelId)?.thinkingToggle ?? false;
+  const thinkingControl = thinkingControlState(availableThinkingLevels, effectiveThinkingLevel, toggleSupported);
+  const thinkingMode = thinkingControl.mode;
+  const hasThinkingToggle = thinkingMode === "toggle" || thinkingMode === "toggle-levels";
+  const thinkingToggleOn = thinkingControl.enabled;
+  const thinkingDisplayLabel = effectiveThinkingLevel
+    ? thinkingLevelMap?.[effectiveThinkingLevel] ?? effectiveThinkingLevel
+    : "auto";
+  const thinkingTriggerLabel = hasThinkingToggle
+    ? !thinkingToggleOn ? t("chat.thinkingOff")
+      : thinkingMode === "toggle" ? t("chat.thinkingOn")
+        // Reuse the primary term from the translated "Reasoning / thinking" label.
+        : `${t("models.reasoning").split(" / ")[0]} · ${thinkingDisplayLabel}`
+    : thinkingDisplayLabel;
+  const selectThinkingLevel = (level: ThinkingControlLevel) => {
+    setThinkingDropdownOpen(false);
+    onThinkingLevelChange?.(level);
+  };
+  const toolPresetLabel = getToolModeLabel(toolPreset);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -2529,13 +2534,17 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 backdropFilter: "blur(10px)",
               } : null),
             }}>
-            {onThinkingLevelChange && (
-              <div ref={thinkingDropdownRef} style={{ position: "relative" }}>
+            {onThinkingLevelChange && thinkingMode !== "none" && (
+              <div ref={thinkingDropdownRef} style={{ position: "relative", display: "flex", alignItems: "center" }}>
                 <button
                   onClick={() => setThinkingDropdownOpen((v) => !v)}
-                  title={isStreaming
-                    ? t("chat.currentReasoning", { level: thinkingDisplayLabel })
-                    : t("chat.changeReasoning", { level: thinkingDisplayLabel })}
+                  aria-haspopup="listbox"
+                  aria-expanded={thinkingDropdownOpen}
+                  title={hasThinkingToggle
+                    ? thinkingTriggerLabel
+                    : isStreaming
+                      ? t("chat.currentReasoning", { level: thinkingDisplayLabel })
+                      : t("chat.changeReasoning", { level: thinkingDisplayLabel })}
                   aria-label={t("chat.changeReasoningLabel")}
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
@@ -2564,42 +2573,37 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     <line x1="7" y1="18" x2="12" y2="18" />
                     <line x1="8" y1="21" x2="11" y2="21" />
                   </svg>
-                  {(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{thinkingDisplayLabel}</span>}
+                  {(!isMobile || controlsMenuOpen) && <span style={{ whiteSpace: "nowrap" }}>{thinkingTriggerLabel}</span>}
                 </button>
                 {thinkingDropdownOpen && (
-                  <div style={{
+                  <div role="listbox" aria-label={t("chat.changeReasoningLabel")} style={{
                     position: "absolute", bottom: "calc(100% + 6px)",
                     ...(isMobile ? { left: 0 } : { right: 0 }),
                     zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
                     borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
                     overflow: "hidden", minWidth: 180,
                   }}>
-                    {THINKING_LEVELS.filter((lvl) => {
-                      if (!availableThinkingLevels) return true;
-                      if (lvl === "auto") return true;
-                      return availableThinkingLevels.includes(lvl);
-                    }).map((lvl) => {
-                      const isActive = lvl === "auto"
-                        ? isAutoThinkingSelection
-                        : !isAutoThinkingSelection && resolvedThinkingLevel === lvl;
-                      const desc = t(THINKING_LEVEL_DESC_KEYS[lvl]);
-                      const mappedVal = (lvl !== "auto" && thinkingLevelMap) ? thinkingLevelMap[lvl] : undefined;
-                      const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
-                      const showOriginal = mappedVal != null && mappedVal !== lvl;
+                    {thinkingControl.menuLevels.map((lvl) => {
+                      const isActive = effectiveThinkingLevel === lvl;
+                      const isBinaryLabel = hasThinkingToggle && (lvl === "off" || thinkingMode === "toggle");
+                      const isToggleOff = thinkingMode === "toggle-levels" && lvl === "off";
+                      const desc = isToggleOff ? t("chat.thinkingOff")
+                        : isBinaryLabel ? null : t(THINKING_LEVEL_DESC_KEYS[lvl]);
+                      const mappedVal = thinkingLevelMap ? thinkingLevelMap[lvl] : undefined;
+                      const displayLabel = isToggleOff ? "off" : isBinaryLabel
+                        ? t(lvl === "off" ? "chat.thinkingOff" : "chat.thinkingOn")
+                        : (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
+                      const showOriginal = !isBinaryLabel && mappedVal != null && mappedVal !== lvl;
                       return (
                         <SelectorRow
                           key={lvl}
                           active={isActive}
                           onSelect={() => {
-                            setThinkingDropdownOpen(false);
-                            if (lvl === "auto") {
-                              if (!isAutoThinkingSelection) onThinkingLevelChange("auto");
-                              return;
-                            }
-                            if (!isActive || isAutoThinkingSelection) onThinkingLevelChange(lvl);
+                            if (!isActive || isAutoThinkingSelection) selectThinkingLevel(lvl);
+                            else setThinkingDropdownOpen(false);
                           }}
                           gutter={Boolean(onSetDefaultThinkingLevel)}
-                          star={onSetDefaultThinkingLevel && lvl !== "auto"
+                          star={onSetDefaultThinkingLevel
                             ? {
                                 isDefault: savedDefaultThinkingLevel === lvl,
                                 saveLabel: t("chat.saveDefaultThinking"),
@@ -2615,7 +2619,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                             {displayLabel}
                             {showOriginal && <span style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)", marginLeft: 5 }}>({lvl})</span>}
                           </span>
-                          <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}>{desc}</span>
+                          {desc && <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}>{desc}</span>}
                         </SelectorRow>
                       );
                     })}
@@ -2670,13 +2674,13 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     overflow: "hidden", minWidth: 120,
                   }}>
                     {TOOL_PRESETS.map((lvl) => {
-                      const preset = TOOL_PRESET_MAP[lvl];
-                      const isActive = (toolPreset ?? "configured") === preset;
+                      const preset = TOOL_MODE_PRESETS[lvl];
+                      // A legacy none/configured label may say build, but selecting build
+                      // must still send the explicit tools rather than keep that legacy state.
+                      const isActive = (toolPreset ?? TOOL_MODE_PRESETS.build) === preset;
                       let desc: string;
-                      if (lvl === "configured") desc = t("chat.configuredTools");
-                      else if (lvl === "chat-only") desc = t("chat.chatOnly");
-                      else if (lvl === "read-only") desc = t("chat.readOnlyTools", { count: 4 });
-                      else if (lvl === "default") desc = t("chat.builtInTools", { count: 4 });
+                      if (lvl === "plan") desc = t("chat.readOnlyTools");
+                      else if (lvl === "build") desc = t("chat.builtInTools");
                       else desc = t("chat.allBuiltInTools");
                       return (
                         <button

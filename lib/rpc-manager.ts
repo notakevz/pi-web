@@ -44,7 +44,7 @@ import {
 } from "./subagents";
 import { createSubagentController } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
-import { resolveShellTools } from "./powershell-settings";
+import { carryCodingToolSelection, localToolPolicy } from "./local-tool-modes";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
 import { createPiWebBuiltinExtensions, createSubagentCodemodeExtension, createSubagentMcpExtensions } from "./builtin-extensions";
@@ -222,7 +222,6 @@ export interface RpcSessionStartOptions {
   thinkingLevel?: ThinkingLevel;
 }
 
-const CODING_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 // Extensions require a complete Theme, while the web UI applies its own styling.
@@ -258,33 +257,13 @@ const CUSTOM_UI_KEYBINDINGS = new TuiKeybindingsManager(TUI_KEYBINDINGS);
 // session. Navigation keeps them although the target branch was recorded without them.
 const SESSION_TOOL_NAMES = new Set<string>(["codemode", "tool_search", ...SUBAGENT_CONTROL_TOOL_NAMES]);
 
-/**
- * The active tools for a coding tool selection. The selection replaces only the coding
- * tools: every other tool named in `carry` that is still registered and not withdrawn stays
- * active, so a tool an extension, `tool_search`, or `defaultTools` activated survives, and a
- * tool one switched off stays off. Nothing else is added: pi itself activates the extension
- * tools it registers (all of them when it builds or reloads a session, then each new one), so
- * `carry` already holds them. An empty selection is Chat only.
- */
+/** Local plan/build/full activation, retaining upstream carry for legacy subsets. */
 export function resolveActiveToolNames(
   session: AgentSessionLike,
   requested: readonly string[],
   carry: readonly string[],
 ): string[] {
-  if (requested.length === 0) return [];
-
-  const codingToolNames = new Set(CODING_TOOL_NAMES);
-  const registered = new Map(session.getAllTools().map((tool) => [tool.name, tool]));
-  const selectedToolNames = resolveShellTools(
-    requested.filter((name) => codingToolNames.has(name)),
-    session.settingsManager.getDefaultTools(),
-  );
-  const carriedToolNames = carry.filter((name) => {
-    const tool = registered.get(name);
-    return tool !== undefined && !codingToolNames.has(name) && tool.exposure !== "hidden";
-  });
-
-  return [...new Set([...selectedToolNames, ...carriedToolNames])];
+  return localToolPolicy(requested, session.getAllTools(), carry, session.settingsManager.getDefaultTools()).active;
 }
 
 // ============================================================================
@@ -490,6 +469,18 @@ export class AgentSessionWrapper {
 
   async waitUntilReady(): Promise<void> {
     await this.waitForExtensionsBound();
+    this.refreshLocalToolMode();
+  }
+
+  /** Reassert the local mode after upstream extension/branch loadout changes. */
+  private refreshLocalToolMode(): void {
+    const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+    if (this.chatOnly || readSubagentSessionResources(entries) || this.inner.isStreaming) return;
+    const policy = localToolPolicy(
+      readSessionToolSelection(entries), this.inner.getAllTools(),
+      this.inner.getActiveToolNames(), this.inner.settingsManager.getDefaultTools(),
+    );
+    this.inner.setActiveToolsByName(policy.active);
   }
 
   /**
@@ -614,7 +605,11 @@ export class AgentSessionWrapper {
 
   /** Apply a coding tool selection; `carry` defaults to the tools active now. */
   setActiveToolSelection(toolNames: string[], carry: readonly string[] = this.inner.getActiveToolNames()): void {
-    this.inner.setActiveToolsByName(resolveActiveToolNames(this.inner, toolNames, carry));
+    const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+    const active = readSubagentSessionResources(entries)
+      ? carryCodingToolSelection(toolNames, this.inner.getAllTools(), carry, this.inner.settingsManager.getDefaultTools())
+      : resolveActiveToolNames(this.inner, toolNames, carry);
+    this.inner.setActiveToolsByName(active);
   }
 
   /**
@@ -635,7 +630,7 @@ export class AgentSessionWrapper {
     if (!readSubagentSessionResources(entries)) {
       const activeAfter = this.inner.getActiveToolNames();
       this.setActiveToolSelection(
-        readSessionToolSelection(entries) ?? activeAfter,
+        readSessionToolSelection(entries) ?? localToolPolicy(undefined, []).builtins,
         [...activeAfter, ...activeBefore.filter((name) => SESSION_TOOL_NAMES.has(name))],
       );
     }
@@ -887,6 +882,7 @@ export class AgentSessionWrapper {
           }
           let prompt: Promise<void>;
           try {
+            this.refreshLocalToolMode();
             prompt = this.inner.prompt(command.message as string, {
               ...(promptImages?.length ? { images: promptImages } : {}),
               ...(streamingBehavior ? { streamingBehavior } : {}),
@@ -1188,6 +1184,7 @@ export class AgentSessionWrapper {
       }
 
       case "get_tools": {
+        this.refreshLocalToolMode();
         // A hidden tool is withdrawn: pi ignores it when setting the active tools.
         const all: ToolInfo[] = this.inner.getAllTools().filter((t) => t.exposure !== "hidden");
         const active = new Set<string>(this.inner.getActiveToolNames());
@@ -1256,9 +1253,12 @@ export class AgentSessionWrapper {
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
         await this.inner.reload();
-        // pi rebuilds from the tools active before, then extensions adjust them as they start
-        // again; carry that result so a tool one switched off during reload stays off.
-        this.setActiveToolSelection(activeToolNames);
+        const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+        if (this.chatOnly || readSubagentSessionResources(entries)) {
+          this.setActiveToolSelection(activeToolNames);
+        } else {
+          this.refreshLocalToolMode();
+        }
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
         }
@@ -2021,6 +2021,7 @@ export class AgentSessionWrapper {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
           },
         });
+        this.refreshLocalToolMode();
       },
     };
   }
@@ -2184,9 +2185,9 @@ export interface SetRpcSessionToolsResult {
 
 /**
  * Persist a normal session's tool selection and rebuild when resource policy changes.
- * An undefined requestedToolNames returns the session to pi's configured defaults:
- * the pin is retracted and the session is rebuilt, because the loadout that
- * settings.json defaultTools resolves to is only known once pi builds the session.
+ * An undefined requestedToolNames retracts the pin and rebuilds the wrapper.
+ * Ordinary sessions then use local build; keep the upstream rebuild boundary
+ * for legacy callers and resource-policy transitions.
  */
 export async function setRpcSessionTools(
   sessionId: string,
@@ -2549,7 +2550,7 @@ export async function startRpcSession(
         : {
             extensionFactories: [
               ...(builtins?.extensions ?? []),
-              createReadOnlyMcpPolicyExtension(),
+              createReadOnlyMcpPolicyExtension(() => settingsManager.getDefaultTools()),
               createProjectCommandBashExtension({
                 cwd: sessionCwd,
                 settings: settingsManager,
@@ -2631,14 +2632,12 @@ export async function startRpcSession(
         : toolsOption !== undefined ? { tools: toolsOption } : {}),
     });
 
-    // A pinned selection replaces only the coding tools of the SDK's initial loadout, which
-    // already holds the extension tools pi activates on registration and whatever
-    // `defaultTools` names (such as `+codemode`), so installed extensions stay usable in
-    // Pi Web just like in the `pi` CLI.
+    // Keep all tools registered (nested/deferred calls need the execution guard),
+    // but bound the declarations by the local mode. No selection means build.
     if (!subagentResources && !chatOnly) {
       const initialToolNames = inner.getActiveToolNames();
       inner.setActiveToolsByName(
-        resolveActiveToolNames(inner, selectedToolNames ?? initialToolNames, initialToolNames),
+        localToolPolicy(selectedToolNames, inner.getAllTools(), initialToolNames, settingsManager.getDefaultTools()).active,
       );
     }
 

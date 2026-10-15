@@ -21,6 +21,14 @@
 # production
 /build
 
+# Machine-local deployment artifacts (operations tools live outside this repo)
+/local/
+/.pi-web-ops/
+/local-release.json
+/validation-home/
+/validation-agent/
+/validation-logs/
+
 # misc
 .DS_Store
 *.pem

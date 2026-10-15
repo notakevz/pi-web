@@ -26,6 +26,7 @@ import { useIsMobile, useIsNarrowMobile } from "@/hooks/useIsMobile";
 import { useViewportHeight } from "@/hooks/useViewportHeight";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useAudio } from "@/hooks/useAudio";
+import { useBackgroundSessionRefresh } from "@/hooks/useBackgroundSessionRefresh";
 import { copyText } from "@/lib/clipboard";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { getFileName } from "@/lib/file-paths";
@@ -179,6 +180,13 @@ export function AppShell() {
       return ids;
     });
   }, []);
+  // Reuse the sidebar's running poll; only background confirmed history is
+  // warmed every 5 s. The selected chat keeps its existing SSE connection.
+  useBackgroundSessionRefresh({
+    sessions: sessionsWithSelection,
+    runningSessionIds,
+    selectedSessionId: selectedSession?.id ?? null,
+  });
   // The temporary id distinguishes consecutive fresh composers in one cwd.
   const [newSessionCwd, setNewSessionCwd] = useState<string | null>(null);
   const [newSessionDraftId, setNewSessionDraftId] = useState("initial");
@@ -1382,8 +1390,8 @@ export function AppShell() {
   const activeFileTab = fileTabs.find((tab) => tab.id === activeFileTabId) ?? null;
   // Subagent work tabs: like files, only the active one is mounted.
   const activeAgentTab = agentTabs.find((tab) => `agent:${tab.sessionId}` === activeFileTabId) ?? null;
-  const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
-  const windowTitle = activeCwdName ? `${activeCwdName} - Pi Web` : "Pi Web";
+  // Keep the browser tab name fixed across projects (not the sidebar/PWA brand).
+  const windowTitle = "Pi";
 
   useEffect(() => {
     const syncWindowTitle = () => {

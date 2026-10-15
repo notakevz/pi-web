@@ -23,6 +23,7 @@ async function sendAndSwitch(stage) {
   const commands = [];
   const sources = [];
   const created = [];
+  const creationRequests = [];
   globalThis.EventSource = class {
     readyState = 0;
     onmessage = null;
@@ -37,7 +38,10 @@ async function sendAndSwitch(stage) {
   globalThis.fetch = async (url, init = {}) => {
     const command = init.body ? JSON.parse(init.body) : null;
     if (url.startsWith("/api/models")) return json({ models: {}, modelList: [] });
-    if (url === "/api/agent/new") return creation.promise;
+    if (url === "/api/agent/new") {
+      creationRequests.push(command);
+      return creation.promise;
+    }
     if (url === "/api/agent/s1" && command) {
       commands.push(command.type);
       return command.type === "prompt" ? acceptance.promise : json({ success: true });
@@ -74,7 +78,7 @@ async function sendAndSwitch(stage) {
     for (const source of sources) source.close();
   }
   if (stage === "mounted") hook.unmount();
-  return { commands, created, opened: sources.length };
+  return { commands, created, creationRequests, opened: sources.length };
 }
 
 for (const stage of ["mounted", "creating", "connecting", "prompting"]) {
@@ -82,6 +86,7 @@ for (const stage of ["mounted", "creating", "connecting", "prompting"]) {
     const result = await sendAndSwitch(stage);
     assert.deepEqual(result.commands, ["prompt"]);
     assert.deepEqual(result.created, ["s1"]);
+    assert.deepEqual(result.creationRequests[0].toolNames, ["bash", "read", "edit", "write", "grep", "find", "ls"], "new chats explicitly start in full, not settings.json defaults");
   });
 }
 
