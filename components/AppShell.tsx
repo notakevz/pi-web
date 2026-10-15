@@ -1408,8 +1408,8 @@ export function AppShell() {
   const activeFileTab = fileTabs.find((tab) => tab.id === activeFileTabId) ?? null;
   // Subagent work tabs: like files, only the active one is mounted.
   const activeAgentTab = agentTabs.find((tab) => `agent:${tab.sessionId}` === activeFileTabId) ?? null;
-  // Keep the browser tab name fixed across projects (not the sidebar/PWA brand).
-  const windowTitle = "Pi";
+  const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
+  const windowTitle = activeCwdName ? `${activeCwdName} - Pi Web` : "Pi Web";
 
   useEffect(() => {
     const syncWindowTitle = () => {
