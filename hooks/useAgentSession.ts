@@ -27,6 +27,7 @@ import { clampSupportedThinkingLevel, modelThinkingDefault } from "@/lib/model-t
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { userMessageKey } from "@/lib/prompt-recovery";
+import { carryMessageKeys, messageRenderKeys } from "@/lib/message-keys";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
 import { isNestedToolExecutionEvent, isSystemMessageEvent } from "@/lib/agent-event-wire";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
@@ -365,6 +366,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [activeToolResults, setActiveToolResults] = useState<Map<string, ToolResultMessage>>(new Map());
   const [entryIds, setEntryIds] = useState<string[]>([]);
+  // Entry ids that took over a run's message keys when the file was read again (lib/message-keys.ts).
+  const [messageKeyAliases, setMessageKeyAliases] = useState<ReadonlyMap<string, string>>(() => new Map());
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [earlierTurnCount, setEarlierTurnCount] = useState(0);
@@ -761,8 +764,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           loadedEntryIds: entryIdsRef.current,
         });
       } else {
-        setMessages(persistedMessages);
-        setEntryIds(d.context.entryIds ?? []);
+        const previous = { messages: messagesRef.current, entryIds: entryIdsRef.current };
+        const next = { messages: persistedMessages, entryIds: d.context.entryIds ?? [] };
+        setMessageKeyAliases((aliases) => carryMessageKeys({ ...previous, aliases }, next));
+        setMessages(next.messages);
+        setEntryIds(next.entryIds);
         setHistoryCursor(d.context.oldestEntryId);
         setHasEarlierMessages(d.context.hasMore);
         setEarlierTurnCount(d.context.turnsBefore ?? 0);
@@ -2904,10 +2910,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const waitingExtensionDialogCount = Math.max(0, extensionDialogs.length - 1);
   const extensionCustomUi = extensionCustomUis[0] ?? null;
   const waitingExtensionCustomUiCount = Math.max(0, extensionCustomUis.length - 1);
+  const messageKeys = useMemo(
+    () => messageRenderKeys(entryIds, messages.length, messageKeyAliases),
+    [entryIds, messages.length, messageKeyAliases],
+  );
 
   return {
     // State
-    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
+    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
     agentRunning, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,

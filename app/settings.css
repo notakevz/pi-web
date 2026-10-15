@@ -430,6 +430,32 @@
   border-top: 1px solid var(--border);
 }
 
+/* Eight digits wide (ch follows the phones' 16px form text), and no taller
+   than the name and id beside it, so the row keeps its height. */
+.model-context-input {
+  flex-shrink: 0;
+  width: calc(8ch + 16px);
+  height: 24px;
+  box-sizing: border-box;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: right;
+}
+
+.model-context-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.model-context-input::placeholder { color: var(--text-dim); }
+.model-context-input[aria-invalid="true"] { border-color: #ef4444; }
+.model-context-input:disabled { opacity: 0.6; }
+
 .enabled-models-row-text {
   min-width: 0;
   flex: 1;

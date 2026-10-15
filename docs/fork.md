@@ -1,6 +1,6 @@
 # Fork customizations
 
-This fork retains the upstream Pi Web package name and version. Its current base is v0.12.1, with the upstream documentation changes through `7cc1803140679f2609febdf792bf5deeb3c636a1`.
+This fork retains the upstream Pi Web package name and version. Its release base is v0.12.1; the source also incorporates upstream main through `e070e0b7322fc59db6ab97f3b69ce7dca83e1337`, including session-scanning, model-runtime, navigation, and UI updates.
 
 ## Application changes
 

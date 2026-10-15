@@ -199,6 +199,74 @@ body {
   flex-direction: column;
 }
 
+/* Light text on a dark background renders heavier with subpixel smoothing
+   (macOS); grayscale smoothing keeps it at the light theme's weight. */
+html.dark {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scroll-edge fades: a scroller with more content past an edge fades its last
+   pixels there, so a cut row or column reads as "more this way". A
+   scroll-driven animation sizes each side's fade from the scroll position:
+   none while the scroller rests on that edge, full once it is
+   --scroll-fade-size away, and none at all when nothing overflows (the
+   timeline is inactive and the properties keep their initial 0px). No script
+   and no re-render on scroll. Browsers without scroll-driven animations
+   (Firefox, Safari before 26) show no fade. */
+@property --scroll-fade-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-fade-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@keyframes scroll-fade-start {
+  from { --scroll-fade-start: 0px; }
+  to { --scroll-fade-start: var(--scroll-fade-size); }
+}
+@keyframes scroll-fade-end {
+  from { --scroll-fade-end: var(--scroll-fade-size); }
+  to { --scroll-fade-end: 0px; }
+}
+@supports (animation-timeline: scroll()) {
+  .session-tree-scroll,
+  .sidebar-files-scroll,
+  .markdown-code-block > pre,
+  .markdown-table-wrap {
+    animation-name: scroll-fade-start, scroll-fade-end;
+    animation-duration: auto;
+    animation-timing-function: linear;
+    animation-fill-mode: both;
+    animation-range: 0px var(--scroll-fade-size), calc(100% - var(--scroll-fade-size)) 100%;
+    mask-repeat: no-repeat;
+  }
+  /* Vertical lists. The classic scrollbar's strip stays unmasked, so the thumb
+     never fades near the ends (--session-tree-scrollbar is its measured
+     width; 0 for an overlay scrollbar). */
+  .session-tree-scroll,
+  .sidebar-files-scroll {
+    --scroll-fade-size: 20px;
+    --scroll-fade-gutter: var(--session-tree-scrollbar, 0px);
+    animation-timeline: scroll(self block);
+    mask-image:
+      linear-gradient(to bottom, transparent, #000 var(--scroll-fade-start), #000 calc(100% - var(--scroll-fade-end)), transparent),
+      linear-gradient(#000, #000);
+    mask-size: calc(100% - var(--scroll-fade-gutter)) 100%, var(--scroll-fade-gutter) 100%;
+    mask-position: left top, right top;
+  }
+  /* Code and tables that scroll sideways. */
+  .markdown-code-block > pre,
+  .markdown-table-wrap {
+    --scroll-fade-size: 28px;
+    animation-timeline: scroll(self inline);
+    mask-image: linear-gradient(to right, transparent, #000 var(--scroll-fade-start), #000 calc(100% - var(--scroll-fade-end)), transparent);
+  }
+}
+
 .web-login-page {
   display: grid;
   min-height: 100%;
@@ -899,6 +967,7 @@ pre, code {
   text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .markdown-body a:hover { text-decoration-color: var(--accent); }
+.markdown-body a[role="link"] { cursor: pointer; }
 .markdown-body img {
   display: block;
   max-width: 100%;
@@ -962,13 +1031,17 @@ pre, code {
   background: var(--bg-subtle);
   color: var(--text-muted);
 }
-.markdown-table-wrap {
+.markdown-table-frame {
   width: 100%;
   margin: 8px 0;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 7px;
+}
+.markdown-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 .markdown-body table {
   border-collapse: separate;
@@ -1033,7 +1106,7 @@ pre, code {
   margin: 3px 0;
   padding: 4px 8px;
 }
-.markdown-custom-message .markdown-table-wrap,
+.markdown-custom-message .markdown-table-frame,
 .markdown-custom-message .markdown-code-block {
   margin: 4px 0;
 }
@@ -1056,7 +1129,7 @@ pre, code {
   margin: 4px 0 8px;
 }
 .markdown-compaction-message li { margin: 2px 0; }
-.markdown-compaction-message .markdown-table-wrap,
+.markdown-compaction-message .markdown-table-frame,
 .markdown-compaction-message .markdown-code-block {
   margin: 6px 0;
 }
