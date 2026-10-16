@@ -117,7 +117,7 @@ lib/
   pi-types.ts               local structural types for pi SDK objects
   pi-sdk-internals.ts       loader for SDK modules the package does not export (MCP connection, config, OAuth)
   tool-presets.ts           PRESET_NONE/READ_ONLY/DEFAULT/FULL + getPresetFromTools()
-  tool-preset-preference.ts legacy browser preference compatibility; fresh composers now start full
+  tool-preset-preference.ts legacy browser preference compatibility; fresh composers now start build
   builtin-extensions.ts     codemode / tool-search / mcp built-ins, sandbox self-test, -builtin: switches
   codemode-settings.ts      Code mode automatic/always (+codemode in global defaultTools), codemode.mode and inlineBudget; project overrides
   codemode-view.ts          display helpers for codemode cards

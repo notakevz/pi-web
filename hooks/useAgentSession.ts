@@ -209,7 +209,7 @@ type ConcreteThinkingLevel = Exclude<ThinkingLevelOption, "auto">;
  * What a fresh composer was told to use instead of the automatic choice. The
  * bar above it moves the composer to another folder by remounting it; these
  * go along with the draft. Tool modes are session-scoped: every new composer
- * starts in full, independent of old browser preferences.
+ * starts in build, independent of old browser preferences.
  */
 export interface NewSessionChoices {
   model: { provider: string; modelId: string } | null;
@@ -947,7 +947,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const selectedModel = newSessionModelOverrideRef.current;
       const selectedThinkingLevel = thinkingLevelOverrideRef.current;
       if (selectedModel) setPendingModel(selectedModel);
-      // Fresh composers send full's complete builtin set explicitly. A user can
+      // Fresh composers send build's four builtin tools explicitly. A user can
       // change this chat's mode, but no browser preference changes the next one.
       const toolNames = getToolNamesForPreset(toolPreset);
       sessionToolsPinnedRef.current = toolNames !== undefined;

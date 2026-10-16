@@ -5,8 +5,8 @@ This fork retains the upstream Pi Web package name and version. Its release base
 ## Application changes
 
 - Browser titles and branding retain upstream behavior: **Pi Web** by default and **<project> - Pi Web** when a project is selected. The Apple web-app title, sidebar brand, PWA naming and icons also retain upstream behavior.
-- The tool menu presents **plan / build / full**. Fresh conversations start in full; historical unpinned sessions and legacy API requests retain build. Changing a conversation's mode does not change the next new conversation's default. Legacy Chat-only sessions remain tool-free.
-- Plan and build constrain model tool calls to their builtin allowlists plus vetted subagent/webfetch implementations. Plan permits scout/planner roles; build permits worker/reviewer. Full enables all registered, nonhidden tools. This is a model execution policy, **not an operating-system sandbox**.
+- The tool menu presents **plan / build / full**. Fresh conversations start in build; historical unpinned sessions and legacy API requests also retain build. Changing a conversation's mode does not change the next new conversation's default. Legacy Chat-only sessions remain tool-free.
+- Plan and build constrain model tool calls to their builtin allowlists plus vetted subagent/webfetch implementations. Plan permits scout/planner roles; build permits scout/planner/worker/reviewer for complete development workflows. The trusted subagent extension must force scout/planner to read-only tools in both plan and build; worker/reviewer keep their role's builtin tools. Full enables all registered, nonhidden tools. This is a model execution policy, **not an operating-system sandbox**.
 - Background running conversations receive bounded history prefetch using the existing sidebar poll, without extra SSE streams or starting sessions. Hidden/offline pages pause prefetch.
 - Reasoning controls use one capability-driven menu. Supported off/on/effort options can save exact SDK-native per-model defaults. Ordinary selections remain session-scoped; model changes restore the target model's saved default without transient display mismatches.
 

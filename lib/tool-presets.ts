@@ -24,9 +24,9 @@ export type ToolPreset = typeof TOOL_PRESET_VALUES[number];
 /** UI names are independent of the persisted/wire preset IDs. */
 export const TOOL_MODE_PRESETS = { plan: "read-only", build: "default", full: "full" } as const;
 export type ToolMode = keyof typeof TOOL_MODE_PRESETS;
-/** Unpinned historical sessions keep build; only newly created composers default to full. */
+/** Fresh composers and unpinned historical sessions default to build. */
 export const DEFAULT_TOOL_PRESET: ConcreteToolPreset = TOOL_MODE_PRESETS.build;
-export const NEW_SESSION_TOOL_PRESET: ConcreteToolPreset = TOOL_MODE_PRESETS.full;
+export const NEW_SESSION_TOOL_PRESET: ConcreteToolPreset = TOOL_MODE_PRESETS.build;
 
 /** Legacy configured/none selections keep their behavior, but show build as before. */
 export function getToolModeLabel(preset: ToolPreset | undefined): ToolMode {

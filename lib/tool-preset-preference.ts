@@ -18,7 +18,7 @@ function getBrowserStorage(): StorageLike | null {
 
 /**
  * Legacy browser preference compatibility, no longer used by useAgentSession.
- * Fresh composers always start in NEW_SESSION_TOOL_PRESET (full); changing the
+ * Fresh composers always start in NEW_SESSION_TOOL_PRESET (build); changing the
  * mode is session-scoped. Kept so older explicit values can still round-trip.
  */
 export function getPreferredToolPreset(

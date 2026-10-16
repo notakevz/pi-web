@@ -117,7 +117,7 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
 test("fresh chats resolve the default model's effort; model switches use each model's own star", async () => {
   const { hook, writes } = await setup();
   try {
-    assert.equal(hook.result.toolPreset, "full");
+    assert.equal(hook.result.toolPreset, "default");
     assert.equal(hook.result.thinkingLevel, "high");
     assert.equal(hook.result.savedDefaultThinkingLevel, "high");
     await hook.result.handleModelChange(qwen.provider, qwen.modelId); hook.flush();
@@ -163,12 +163,12 @@ test("off is a model-bound default for both Qwen and Gemma", async () => {
   } finally { hook.unmount(); }
 });
 
-test("starting a fresh chat sends its selected model and full tools, without turning resolved effort into an override", async () => {
+test("starting a fresh chat sends its selected model and build tools, without turning resolved effort into an override", async () => {
   const { hook, creations, serverLevel, initialize } = await setup();
   try {
     await hook.result.handleModelChange(qwen.provider, qwen.modelId); hook.flush();
     await initialize(); hook.flush();
-    assert.deepEqual(creations[0].toolNames, ["bash", "read", "edit", "write", "grep", "find", "ls"]);
+    assert.deepEqual(creations[0].toolNames, ["read", "bash", "edit", "write"]);
     assert.equal(creations[0].modelId, qwen.modelId);
     assert.equal(creations[0].thinkingLevel, undefined, "SDK resolves the native saved default atomically");
     assert.equal(serverLevel(), "low");
@@ -216,16 +216,16 @@ test("failed star saves do not move the marker or overwrite a temporary selectio
   } finally { hook.unmount(); }
 });
 
-test("tool changes affect this chat only; remounting a fresh chat starts in full", async () => {
+test("tool changes affect this chat only; remounting a fresh chat starts in build", async () => {
   const { hook, preferences, writes } = await setup();
   try {
-    await hook.result.handleToolPresetChange("default"); hook.flush();
-    assert.equal(hook.result.toolPreset, "default");
+    await hook.result.handleToolPresetChange("full"); hook.flush();
+    assert.equal(hook.result.toolPreset, "full");
     assert.equal(preferences.get("pi-tool-preset"), "full", "legacy browser data is neither read nor rewritten");
     assert.deepEqual(writes, []);
   } finally { hook.unmount(); }
   const fresh = await setup();
-  try { assert.equal(fresh.hook.result.toolPreset, "full"); }
+  try { assert.equal(fresh.hook.result.toolPreset, "default"); }
   finally { fresh.hook.unmount(); }
 });
 

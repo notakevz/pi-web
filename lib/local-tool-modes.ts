@@ -59,7 +59,7 @@ function isLimitedModeExtra(tool: LocalModeTool): boolean {
 
 export function localModeGuideline(mode: LocalToolMode): string | undefined {
   if (mode !== "plan" && mode !== "build") return undefined;
-  return `Current tool mode: ${mode === "plan" ? "plan; subagent roles: scout / planner (read-only)." : "build; subagent roles: worker / reviewer."} Switch modes explicitly for other roles.`;
+  return `Current tool mode: ${mode === "plan" ? "plan; subagent roles: scout / planner (read-only)." : "build; subagent roles: scout / planner (read-only), worker / reviewer."} Use only user-level roles; switch modes explicitly for other roles.`;
 }
 
 /** Return a refusal for every disallowed call, including nested/deferred calls. */
@@ -78,7 +78,7 @@ export function localToolCallBlockReason(
     return `Tool "${toolName}" is disabled in this session's ${policy.mode} mode.`;
   }
   if (!limited || toolName !== "subagent") return undefined;
-  const roles = policy.mode === "plan" ? ["scout", "planner"] : ["worker", "reviewer"];
+  const roles = policy.mode === "plan" ? ["scout", "planner"] : ["scout", "planner", "worker", "reviewer"];
   const params = input as { agentScope?: unknown; agent?: unknown; tasks?: unknown; chain?: unknown } | null;
   if (!params || typeof params !== "object" || Array.isArray(params)) return "Invalid plan/build subagent request.";
   if (params.agentScope !== undefined && params.agentScope !== "user") return "plan/build subagents must use user-level roles.";

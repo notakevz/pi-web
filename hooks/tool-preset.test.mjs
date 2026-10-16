@@ -22,7 +22,7 @@ globalThis.EventSource = class {
   close() { this.readyState = 2; }
 };
 
-test("fresh composers start in full regardless of old browser preferences", async () => {
+test("fresh composers start in build regardless of old browser preferences", async () => {
   globalThis.fetch = async () => Response.json({ models: {}, modelList: [] });
   for (const preset of [undefined, "default", "read-only", "full", "none", "configured"]) {
     preferences.clear();
@@ -31,7 +31,7 @@ test("fresh composers start in full regardless of old browser preferences", asyn
     try {
       await settle();
       hook.flush();
-      assert.equal(hook.result.toolPreset, "full");
+      assert.equal(hook.result.toolPreset, "default");
     } finally {
       hook.unmount();
     }
