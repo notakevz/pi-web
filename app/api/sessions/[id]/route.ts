@@ -20,6 +20,7 @@ import { readSubagentRun, readSubagentSessionResources } from "@/lib/subagents";
 import { readSessionToolSelection } from "@/lib/session-tool-selection";
 import { jsonResponse } from "@/lib/json-response";
 import { deleteSessions } from "@/lib/session-delete";
+import { attachTranscriptNotices, collectTranscriptNotices, readShowCacheMissNotices, withSessionPrices } from "@/lib/transcript-notices-server";
 
 export async function GET(
   req: Request,
@@ -56,12 +57,16 @@ export async function GET(
     const entries = sm.getEntries();
     const leafId = sm.getLeafId();
     const summaryTree = searchParams.get("tree") === "summary";
+    const header = sm.getHeader();
+    // Only read the effective switch before validation, never scan notices here.
+    const showNotices = header?.cwd ? readShowCacheMissNotices(header.cwd) : false;
     // Validate background views before projecting the full tree/context/stats.
     // No force: background reads must never evict or start a runtime wrapper.
     const latestEntry = entries[entries.length - 1] as { id?: string } | undefined;
     const snapshotRevision = computeSessionRevision({
       filePath,
-      sourceId: liveRpc ? `runtime:${String(liveRpc.inner.sessionId)}` : "disk",
+      // The effective notices switch changes messages without touching the session file.
+      sourceId: `${liveRpc ? `runtime:${String(liveRpc.inner.sessionId)}` : "disk"}${showNotices ? "+notices" : ""}`,
       entryCount: entries.length,
       latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
       leafId: leafId ?? null,
@@ -81,12 +86,20 @@ export async function GET(
     const deferToolResultImages = searchParams.has("deferMedia");
     const rawTail = Number(searchParams.get("tail"));
     const tail = Number.isFinite(rawTail) && rawTail > 0 ? Math.min(rawTail, 1000) : 50;
-    const context = buildSessionContext(entries as never, leafId, {
+    // pi's showCacheMissNotices (#1265): cache, cost and provider notices on the messages they follow.
+    const transcriptNotices = showNotices
+      ? collectTranscriptNotices(
+          entries as unknown as SessionEntry[],
+          withSessionPrices(entries as unknown as SessionEntry[], liveRpc?.inner.modelRuntime),
+          { leafId },
+        )
+      : undefined;
+    const context = attachTranscriptNotices(buildSessionContext(entries as never, leafId, {
       deferThinking,
       deferToolResultImages,
       tail,
       sessionId: id, // local: lazy URLs for historical tool-result images
-    });
+    }), transcriptNotices);
     perf?.span("context");
     const totalActiveMs = computeSessionTotalActiveMs(entries);
     // Cumulative usage over ALL entries, including history compacted away —
@@ -98,7 +111,6 @@ export async function GET(
     const firstUserEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
     const firstUserMessage = firstUserEntry?.type === "message" ? firstUserEntry.message : undefined;
 
-    const header = sm.getHeader();
     let modified = header?.timestamp ?? new Date().toISOString();
     try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
     const parentSessionId = header?.parentSession

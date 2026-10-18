@@ -23,6 +23,8 @@ import { CODEMODE_TOOL_NAME, codemodeCalls, codemodeScript, codemodeScriptPrevie
 import { CodemodeCallList } from "./CodemodeToolView";
 import { mcpToolLabel, prettyMcpResultText } from "@/lib/mcp-tool-display";
 import { streamRateKey, streamRateStart, streamTokensPerSecond, type StreamRateStart } from "@/lib/stream-token-rate";
+import { getTranscriptNotices } from "@/lib/transcript-notices";
+import { TRANSCRIPT_NOTICE_WARNING_COLOR, transcriptNoticeText } from "@/components/TranscriptNotices";
 import type {
   AgentMessage,
   UserMessage,
@@ -1696,6 +1698,8 @@ function CompactionMessageView({ message }: { message: CustomMessage }) {
   const summary = getMessageText(message.content);
   const time = formatTime(message.timestamp);
   const tokensBefore = (message.details as { tokensBefore?: unknown } | undefined)?.tokensBefore;
+  // pi's showCacheMissNotices (#1265): what the compaction billed, in its card.
+  const costNotice = getTranscriptNotices(message).find((notice) => notice.kind === "summary_cost" && notice.source === "compaction");
 
   return (
     <div style={{ marginBottom: 16 }}>
@@ -1754,6 +1758,11 @@ function CompactionMessageView({ message }: { message: CustomMessage }) {
               {typeof tokensBefore === "number" && Number.isFinite(tokensBefore) && (
                 <span style={{ display: "block", marginTop: 3, color: "var(--text-muted)", fontSize: "calc(13px + var(--chat-font-size-offset, 0px))", lineHeight: 1.5 }}>
                   {t("i18n.compactedFromTokens", { tokens: tokensBefore.toLocaleString() })}
+                </span>
+              )}
+              {costNotice && (
+                <span style={{ display: "block", marginTop: 2, color: TRANSCRIPT_NOTICE_WARNING_COLOR, fontSize: "calc(12px + var(--chat-font-size-offset, 0px))", lineHeight: 1.5 }}>
+                  {transcriptNoticeText(t, costNotice)}
                 </span>
               )}
             </span>

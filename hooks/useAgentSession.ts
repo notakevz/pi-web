@@ -35,6 +35,7 @@ import { CODEMODE_TOOL_NAME, getCodemodeProgress } from "@/lib/codemode-view";
 import { updateExtensionWidgets } from "@/lib/extension-widgets";
 import { bareMcpOpensSettings } from "@/lib/mcp-command";
 import type { SettingsSection } from "@/lib/settings-navigation";
+import { withTranscriptNotices, type TranscriptNotice } from "@/lib/transcript-notices";
 import {
   enqueueExtensionUiRequest,
   removeExtensionUiRequest,
@@ -1655,7 +1656,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             return [...prev, delivered];
           });
         } else if (completed) {
-          setMessages((prev) => [...prev, normalizeToolCalls(completed)]);
+          // pi's showCacheMissNotices (#1265): the wrapper sends them beside the message.
+          const notices = Array.isArray(event.transcriptNotices) ? event.transcriptNotices as TranscriptNotice[] : undefined;
+          setMessages((prev) => [...prev, withTranscriptNotices(normalizeToolCalls(completed), notices)]);
           if (completed.role === "assistant") {
             const sid = sessionIdRef.current;
             if (sid) void refreshContextUsage(sid);
