@@ -26,7 +26,7 @@ globalThis.EventSource = class {
   close() { this.readyState = 2; }
 };
 
-async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(qwen)]: "low" }, pins = {}, saveGate, saveError, fallback = "medium", creationGate, modelGate, thinkingGates = {}, detailGate, failCommand, staleDefaults, backgroundReadGate, backgroundStateGate, agentReadGate, agentFullState, canonicalFailure, reselectLevel, effortReadGate, lostModelReply = false, hookImplementation = useAgentSession, renderImplementation = renderHook } = {}) {
+async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(qwen)]: "low" }, pins = {}, saveGate, saveError, fallback = "medium", creationGate, modelGate, modelAckGates = {}, thinkingGates = {}, detailGate, failCommand, staleDefaults, backgroundReadGate, backgroundStateGate, agentReadGate, agentFullState, canonicalFailure, reselectLevel, effortReadGate, lostModelReply = false, hookImplementation = useAgentSession, renderImplementation = renderHook } = {}) {
   let catalog = {
     models: {}, modelList: [gpt, qwen, gemma].map(({ provider, modelId }) => ({ provider, id: modelId, name: modelId })),
     defaultModel: gpt, defaultThinkingLevel: defaults[key(gpt)] ?? "medium",
@@ -112,7 +112,8 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
         // every later effort write too, not just the set_model response.
         serverSupported = sameModel && reselectLevel === "off" ? ["off"] : undefined;
         data = { provider: body.provider, id: body.modelId };
-        if (modelGate) await modelGate.promise;
+        const ackGate = modelAckGates[commands.filter((command) => command.type === "set_model").length] ?? modelGate;
+        if (ackGate) await ackGate.promise;
         if (lostModelReply) throw new Error("fixture lost model reply");
       }
       if (body.type === "set_thinking_level") {
@@ -475,8 +476,9 @@ for (const existing of [false, true]) {
       assert.equal(hook.result.modelSwitching, true);
       await hook.result.handleModelChange(gpt.provider, gpt.modelId);
       const choosing = hook.result.handleThinkingLevelChange("low"); hook.flush();
+      await hook.result.handleModelChange(qwen.provider, qwen.modelId);
       assert.equal(hook.result.thinkingLevel, "low");
-      assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }], "duplicate refreshes are suppressed; explicit effort waits on the flight");
+      assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }], "rejected selections must not invalidate the explicit effort waiting on the flight");
       modelGate.resolve(); await settle(); hook.flush();
       assert.equal(hook.result.modelSwitching, true, "flight includes canonical validation");
       assert.equal(hook.result.thinkingLevel, "low");
@@ -591,6 +593,80 @@ for (const existing of [false, true]) {
     } finally { modelGate.resolve(); effortReadGate.resolve(); explicitGate.resolve(); hook.unmount(); }
   });
 }
+
+async function selectionEpochScenario({ existing, hookImplementation, renderImplementation } = {}) {
+  const modelGate = Promise.withResolvers(), secondAckGate = Promise.withResolvers(), effortReadGate = Promise.withResolvers();
+  const { hook, initialize, effortReads, commands, choices } = await setup({ existing, modelGate,
+    modelAckGates: { 2: secondAckGate }, effortReadGate, reselectLevel: "off", hookImplementation, renderImplementation });
+  const snapshot = () => ({ model: hook.result.displayModel, level: hook.result.thinkingLevel,
+    switching: hook.result.modelSwitching, choices: choices.at(-1) });
+  try {
+    if (!existing) { await initialize(); hook.flush(); }
+    const start = commands.length;
+    const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId);
+    const choosing = hook.result.handleThinkingLevelChange("low");
+    modelGate.resolve(); await refreshing; await settle(); hook.flush();
+    assert.equal(effortReads.length, 1, "A's effort GET must have captured the native clamp before B starts");
+    assert.equal(effortReads[0].thinkingLevel, "off");
+    assert.equal(hook.result.thinkingLevel, "low", "A's effort confirmation is still gated");
+
+    let switchFinished = false;
+    const switching = hook.result.handleModelChange(qwen.provider, qwen.modelId).then(() => { switchFinished = true; });
+    await settle(); hook.flush();
+    assert.equal(switchFinished, false, "the second set_model ACK, not just canonical history, must be gated");
+    assert.deepEqual(commands.slice(start), [
+      { type: "set_model", ...gpt }, { type: "set_thinking_level", level: "low" }, { type: "set_model", ...qwen },
+    ], "B's default effort write must not have started before its model ACK");
+    const beforeRead = snapshot();
+    // No newer effort pick: changeId and the confirmed-write floor alone cannot
+    // reject A's old off while B's selection has started but is unacknowledged.
+    effortReadGate.resolve(); await choosing; hook.flush();
+    assert.equal(switchFinished, false);
+    const beforeAck = snapshot();
+    secondAckGate.resolve(); await switching; await settle(); hook.flush();
+    const afterAck = snapshot();
+    assert.deepEqual(commands.slice(start).filter((command) => command.type === "set_thinking_level"), [
+      { type: "set_thinking_level", level: "low" }, { type: "set_thinking_level", level: "low" },
+    ], "only A's queued effort and B's resolved default are written; no new explicit effort hides the race");
+    return { beforeRead, beforeAck, afterAck };
+  } finally { modelGate.resolve(); secondAckGate.resolve(); effortReadGate.resolve(); hook.unmount(); }
+}
+
+for (const existing of [false, true]) {
+  test(`selection epoch rejects A's effort GET while B's model ACK is pending (${existing ? "restored" : "initialized draft"})`, async () => {
+    const { beforeRead, beforeAck, afterAck } = await selectionEpochScenario({ existing });
+    for (const [phase, snapshot] of Object.entries({ beforeRead, beforeAck, afterAck })) {
+      assert.deepEqual(snapshot.model, qwen, phase);
+      assert.equal(snapshot.level, "low", `${phase}: B keeps its own resolved default`);
+      assert.equal(snapshot.switching, phase !== "afterAck", phase);
+      if (!existing) {
+        assert.deepEqual(snapshot.choices.model, qwen, phase);
+        assert.equal(snapshot.choices.thinkingLevel, null, `${phase}: A's clamp must never become B's explicit draft effort`);
+      }
+    }
+  });
+}
+
+test("negative control: without the selection epoch A's effort GET poisons B before its model ACK", async () => {
+  const source = readFileSync(new URL("./useAgentSession.ts", import.meta.url), "utf8");
+  const guard = "\n      && modelSelectionEpochRef.current === selectionEpoch";
+  assert.equal(source.split(guard).length, 2, "disable only the effort handler's new epoch check");
+  const { useAgentSession: legacyHook, renderLegacyHook } = await jiti.evalModule(source.replace(guard, "") + '\nexport { renderHook as renderLegacyHook } from "react";', {
+    filename: fileURLToPath(new URL("./__negative-selection-epoch.ts", import.meta.url)), forceTranspile: true, async: true,
+  });
+  for (const existing of [false, true]) {
+    const { beforeRead, beforeAck, afterAck } = await selectionEpochScenario({ existing, hookImplementation: legacyHook, renderImplementation: renderLegacyHook });
+    assert.equal(beforeRead.level, "low");
+    assert.equal(beforeAck.level, "off", "old confirmation clears B's optimistic effort before its ACK");
+    assert.equal(afterAck.level, existing ? "low" : "off", "initialized draft stays poisoned even after B succeeds");
+    if (!existing) {
+      for (const snapshot of [beforeAck, afterAck]) {
+        assert.deepEqual(snapshot.choices.model, qwen);
+        assert.equal(snapshot.choices.thinkingLevel, "off", "A's clamp was saved as B's explicit draft choice");
+      }
+    }
+  }
+});
 
 for (const canonicalFailure of [undefined, "http", "transport"]) {
   test(`same-id confirmed-write floor rejects pre-reselect history after canonical ${canonicalFailure ?? "success"}`, async () => {

@@ -459,6 +459,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const newSessionModelOverrideRef = useRef<SelectedModel | null>(initialChoices?.model ?? null);
   const thinkingLevelOverrideRef = useRef<ConcreteThinkingLevel | null>(initialChoices?.thinkingLevel ?? null);
   const thinkingLevelChangeIdRef = useRef(0);
+  // Invalidate old effort work at selection start, before any model RPC ACK.
+  // Separate from effort picks and confirmed writes; A → B → A is still new.
+  const modelSelectionEpochRef = useRef(0);
   const thinkingLevelPinsRef = useRef<Record<string, string>>({});
   const modelThinkingDefaultsRef = useRef<Record<string, string>>({});
   const modelThinkingLevelsRef = useRef<Record<string, string[]>>({});
@@ -2037,6 +2040,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
     if (modelSwitchPendingRef.current) return;
+    ++modelSelectionEpochRef.current;
     const target = { provider, modelId };
     if (displayModelRef.current?.provider === provider && displayModelRef.current?.modelId === modelId) {
       // Reselect rebinds saved definitions, not this model's default effort.
@@ -2567,10 +2571,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
     const changeId = ++thinkingLevelChangeIdRef.current;
+    const selectionEpoch = modelSelectionEpochRef.current;
     const generation = sessionMountGenerationRef.current;
     const initialSid = sessionIdRef.current;
     const isCurrent = () => sessionHookMountedRef.current
-      && sessionMountGenerationRef.current === generation && thinkingLevelChangeIdRef.current === changeId;
+      && sessionMountGenerationRef.current === generation && thinkingLevelChangeIdRef.current === changeId
+      && modelSelectionEpochRef.current === selectionEpoch;
     if (level === "auto") {
       thinkingLevelOverrideRef.current = null;
       setNewSessionThinkingLevel(null);
