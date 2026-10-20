@@ -1776,8 +1776,8 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     ]);
   }, [applyUiState, focusAfterCommit, familyRowButton, openArchiveView, restoreUnread, showToast, snapshotUiState, t, unreadSessionIds]);
 
-  // The row's archive button. A running family would come straight back, so
-  // it is not archived (the row offers no button for it either).
+  // The row menu's archive action. A running family would come straight back,
+  // so it is not archived (the menu disables the action for it too).
   const archiveFamily = useCallback((family: SessionFamily) => {
     if (familyIds(family).some((id) => runningSessionIds.has(id))) return;
     archiveFamilies([family]);
@@ -2620,7 +2620,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     onShowMore: handleShowMore,
     onShowLess: handleShowLess,
     onTogglePinned: handleTogglePinned,
-    onArchiveFamily: archiveFamily,
     onRestoreFamily: restoreFamily,
     onOpenRowMenu: openRowMenu,
     onRowContextMenu: handleContextMenu,

@@ -112,7 +112,6 @@ export interface SessionTreeProps {
   /** Back to the base limit; key is a projectKey or PINNED_MORE_KEY. */
   onShowLess(key: string): void;
   onTogglePinned(): void;
-  onArchiveFamily(family: SessionFamily): void;
   onRestoreFamily(family: SessionFamily): void;
   onOpenRowMenu(row: SessionRow, anchor: SidebarMenuAnchor, opener: HTMLElement | null): void;
   /** The sidebar dispatches the downstream event first. */
@@ -608,9 +607,9 @@ const SessionRowView = memo(function SessionRowView({
     meta = formatShortRelativeTime(family.latestModified, locale, nowDate);
   }
 
-  // Archive (or restore) one click away: desktop only, never for a running
-  // family, which would come straight back.
-  const quickAction = layout === "desktop" && (context === "archive" || !status.running);
+  // Keep archiving in the row menu to avoid accidental clicks. Only the
+  // archive view offers a one-click restore, on desktop as before.
+  const quickAction = layout === "desktop" && context === "archive";
 
   const mainContent = (
     <>
@@ -668,7 +667,7 @@ const SessionRowView = memo(function SessionRowView({
       )}
       {!status.transient && (
         <span className="session-tree-actions">
-          {quickAction && (context === "archive" ? (
+          {quickAction && (
             <button
               type="button"
               className="session-tree-action session-tree-quick-action"
@@ -681,20 +680,7 @@ const SessionRowView = memo(function SessionRowView({
             >
               <RestoreIcon size={13} />
             </button>
-          ) : (
-            <button
-              type="button"
-              className="session-tree-action session-tree-quick-action"
-              aria-label={t("sidebar.archive")}
-              title={t("sidebar.archive")}
-              onClick={(event) => {
-                event.stopPropagation();
-                handlers.current.onArchiveFamily(family);
-              }}
-            >
-              <ArchiveIcon size={13} />
-            </button>
-          ))}
+          )}
           <button
             type="button"
             className={`session-tree-action session-tree-more-action${menuOpen ? " is-active" : ""}`}

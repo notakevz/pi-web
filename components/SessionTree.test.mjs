@@ -45,7 +45,6 @@ const defaults = {
   onShowMore: noop,
   onShowLess: noop,
   onTogglePinned: noop,
-  onArchiveFamily: noop,
   onRestoreFamily: noop,
   onOpenRowMenu: noop,
   onRowContextMenu: noop,
@@ -168,7 +167,7 @@ test("a group's ⋯ shows its open menu; its + starts a session at once", () => 
   assert.equal(plus, '<button type="button" class="session-tree-group-action" aria-label="New session in app" title="New session in app">');
 });
 
-test("an idle session row shows its short time, branch and both actions", () => {
+test("an idle session row shows its short time, branch and only the menu action", () => {
   const root = session("idle", { isWorktree: true, branch: "feat/rows" });
   const html = rowMarkup(render({ rows: [sessionRow(root)] }), "session:group:idle");
   assert.match(html, /^<div class="session-tree-row session-tree-session" style="top:0;height:28px" data-row-key="session:group:idle">/);
@@ -177,7 +176,7 @@ test("an idle session row shows its short time, branch and both actions", () => 
   // The branch keeps the upstream icon and type; the tooltip keeps the ⑂ glyph.
   assert.match(html, /<a class="session-tree-main" href="\?session=idle" title="[^"]*"><span class="session-tree-title">first idle<\/span><span class="session-tree-branch"><svg width="10" height="10"[^>]*class="session-tree-branch-icon" aria-hidden="true">[\s\S]*?<\/svg>feat\/rows<\/span><span class="session-tree-meta">5m<\/span><\/a>/);
   assert.match(html, /title="first idle\n3 msgs · 5 minutes ago · ⑂ feat\/rows"/);
-  assert.match(html, /class="session-tree-action session-tree-quick-action" aria-label="Archive" title="Archive"/);
+  assert.doesNotMatch(html, /session-tree-quick-action|aria-label="Archive"/);
   assert.match(html, /class="session-tree-action session-tree-more-action" aria-label="More actions" title="More actions" aria-haspopup="menu" aria-expanded="false"/);
   assert.doesNotMatch(html, /aria-current/);
 });
@@ -288,7 +287,8 @@ test("every saved row's title links to its session, encoded, in every context an
 test("pinned rows name their project and archived rows offer restore with the archive time", () => {
   const pinned = rowMarkup(render({ rows: [sessionRow(session("pin"), { context: "pinned" })] }), "session:pinned:pin");
   assert.match(pinned, /<span class="session-tree-meta"><span class="session-tree-project">app<\/span><\/span>/);
-  assert.match(pinned, /aria-label="Archive"/);
+  assert.doesNotMatch(pinned, /session-tree-quick-action|aria-label="Archive"/);
+  assert.match(pinned, /aria-label="More actions"/);
 
   const archived = rowMarkup(render({
     rows: [sessionRow(session("old"), { context: "archive", archivedAt: NOW - 2 * 60 * MINUTE })],
@@ -300,7 +300,22 @@ test("pinned rows name their project and archived rows offer restore with the ar
   assert.doesNotMatch(archived, /aria-label="Archive"/);
 });
 
-test("the phone layout uses tall rows, keeps ⋯ and drops the archive quick button", () => {
+test("live session rows offer only ⋯ across layouts, contexts and activity states", () => {
+  for (const layout of ["desktop", "mobile"]) {
+    for (const context of ["group", "pinned"]) {
+      for (const status of [{}, { selected: true }, { unread: true }, { running: true }, { running: true, awaiting: true }]) {
+        const row = sessionRow(session("live"), { context, status });
+        const html = rowMarkup(render({ layout, rows: [row] }), row.key);
+        const label = `${layout} ${context} ${JSON.stringify(status)}`;
+        assert.doesNotMatch(html, /session-tree-quick-action|aria-label="Archive"|aria-label="Restore"/, label);
+        assert.equal((html.match(/<button\b/g) ?? []).length, 1, label);
+        assert.match(html, /aria-label="More actions"[^>]*aria-haspopup="menu"/, label);
+      }
+    }
+  }
+});
+
+test("the phone layout uses tall rows and keeps only ⋯, including in the archive", () => {
   const html = render({ layout: "mobile", rows: [groupRow(), sessionRow(session("m"))] });
   assert.match(html, /^<div class="session-tree is-mobile">/);
   assert.match(rowMarkup(html, "group:/work/app"), /style="top:0;height:44px"/);
@@ -308,6 +323,9 @@ test("the phone layout uses tall rows, keeps ⋯ and drops the archive quick but
   assert.match(row, /style="top:44px;height:44px"/);
   assert.match(row, /aria-label="More actions"/);
   assert.doesNotMatch(row, /aria-label="Archive"/);
+  const archived = render({ layout: "mobile", rows: [sessionRow(session("old"), { context: "archive", archivedAt: NOW })] });
+  assert.match(archived, /aria-label="More actions"/);
+  assert.doesNotMatch(archived, /session-tree-quick-action|aria-label="Restore"/);
 });
 
 test("a summary row without details shows an ellipsis instead of a message count", () => {

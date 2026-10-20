@@ -4,6 +4,8 @@ This fork retains the upstream Pi Web package name and version. Its latest relea
 
 ## Application changes
 
+- Live session rows expose only the **⋯ menu**, not a one-click archive button, to reduce accidental archiving. Archive remains in the menu with Undo; the archive view retains its desktop one-click Restore.
+
 - The tool menu presents **plan / build / full**. Fresh conversations start in build; historical unpinned sessions and legacy API requests also retain build. Changing a conversation's mode does not change the next new conversation's default. Legacy Chat-only sessions remain tool-free.
 - Plan and build constrain model tool calls to their builtin allowlists plus vetted subagent/webfetch implementations. Plan permits scout/planner roles; build permits scout/planner/worker/reviewer for complete development workflows. The trusted subagent extension must force scout/planner to read-only tools in both plan and build; worker/reviewer keep their role's builtin tools. Full enables all registered, nonhidden tools. This is a model execution policy, **not an operating-system sandbox**.
 - Background running conversations receive bounded history prefetch using the existing sidebar poll, without extra SSE streams or starting sessions. Hidden/offline pages pause prefetch. History revisions include the effective upstream notices switch: toggling it invalidates cached messages, while unchanged validation reads only the switch and skips notice scans. Notices settings reads are bounded and non-blocking for both global and project files.
