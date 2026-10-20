@@ -23,6 +23,7 @@ for (const status of [200, 404, 500]) {
     };
     const id = `late-view-${status}`;
     let release, stateReads = 0, detailReads = 0;
+    const unexpected = [];
     const gate = new Promise((resolve) => { release = resolve; });
     globalThis.fetch = async (url) => {
       if (url.startsWith(`/api/sessions/${id}?`)) {
@@ -35,7 +36,8 @@ for (const status of [200, 404, 500]) {
       }
       if (url === `/api/sessions/${id}/state`) { stateReads++; return Response.json({ running: false }); }
       if (url.startsWith("/api/models")) return Response.json({ models: {}, modelList: [] });
-      if (url === `/api/agent/${id}`) return Response.json({ running: false });
+      if (url === `/api/agent/${id}?systemPrompt=0` || url === `/api/agent/${id}`) return Response.json({ running: false });
+      unexpected.push(url);
       throw new Error(`unexpected fetch ${url}`);
     };
     let hook;
@@ -53,6 +55,7 @@ for (const status of [200, 404, 500]) {
       release(); await settle();
       assert.strictEqual(peekSessionViewSnapshot(id), final);
       assert.equal(stateReads, 0, "departed hooks do not continue into state hydration");
+      assert.deepEqual(unexpected, [], "status mocks must match even when the hook catches fetch errors");
     } finally {
       release(); hook?.unmount(); await settle();
       resetSessionViewCacheForTests();

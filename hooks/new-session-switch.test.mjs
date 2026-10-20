@@ -23,7 +23,7 @@ async function sendAndSwitch(stage) {
   const commands = [];
   const sources = [];
   const created = [];
-  const creationRequests = [];
+  const creationRequests = [], unexpected = [];
   globalThis.EventSource = class {
     readyState = 0;
     onmessage = null;
@@ -46,7 +46,8 @@ async function sendAndSwitch(stage) {
       commands.push(command.type);
       return command.type === "prompt" ? acceptance.promise : json({ success: true });
     }
-    if (url === "/api/agent/s1") return json({ running: true, state: { isStreaming: true, isPromptRunning: true } });
+    if (!command && (url === "/api/agent/s1?systemPrompt=0" || url === "/api/agent/s1")) return json({ running: true, state: { isStreaming: true, isPromptRunning: true } });
+    unexpected.push(`${init.method ?? "GET"} ${url}`);
     throw new Error(`unexpected fetch ${url} ${init.body ?? ""}`);
   };
 
@@ -78,6 +79,7 @@ async function sendAndSwitch(stage) {
     for (const source of sources) source.close();
   }
   if (stage === "mounted") hook.unmount();
+  assert.deepEqual(unexpected, [], "startup must not swallow status URL mock mismatches");
   return { commands, created, creationRequests, opened: sources.length };
 }
 

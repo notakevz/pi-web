@@ -32,6 +32,7 @@ test("a warmed snapshot paints immediately, restores plan, and preserves paged h
     toolNames, loadedEntryIds: entryIds, totalActiveMs: 100,
   });
   let detailReads = 0;
+  const unexpected = [];
   let releaseDetail;
   const detailGate = new Promise((resolve) => { releaseDetail = resolve; });
   globalThis.fetch = async (url) => {
@@ -52,7 +53,8 @@ test("a warmed snapshot paints immediately, restores plan, and preserves paged h
       models: {}, modelList: [{ provider: model.provider, id: model.modelId, name: "Fixture" }],
       defaultModel: model, defaultThinkingLevel: "medium", thinkingLevels: { "fixture:fixture": ["off", "medium"] },
     });
-    if (url === `/api/agent/${id}`) return Response.json({ running: false });
+    if (url === `/api/agent/${id}?systemPrompt=0` || url === `/api/agent/${id}`) return Response.json({ running: false });
+    unexpected.push(url);
     throw new Error(`unexpected fetch ${url}`);
   };
   let hook;
@@ -66,6 +68,7 @@ test("a warmed snapshot paints immediately, restores plan, and preserves paged h
     releaseDetail();
     await settle(); hook.flush();
     assert.equal(detailReads, 1);
+    assert.deepEqual(unexpected, [], "status mocks must match even when the hook catches fetch errors");
     assert.equal(hook.result.messages.length, 100);
     assert.equal(hook.result.earlierTurnCount, 7);
     const cached = getSessionViewSnapshot(id);

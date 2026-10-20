@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { createJiti } from "jiti";
 
 const shimPath = fileURLToPath(new URL("./__fixtures__/react-hook-shim.mjs", import.meta.url));
@@ -25,7 +26,7 @@ globalThis.EventSource = class {
   close() { this.readyState = 2; }
 };
 
-async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(qwen)]: "low" }, pins = {}, saveGate, saveError, fallback = "medium", creationGate, modelGate, thinkingGates = {}, detailGate, failCommand, staleDefaults, backgroundReadGate, canonicalFailure } = {}) {
+async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(qwen)]: "low" }, pins = {}, saveGate, saveError, fallback = "medium", creationGate, modelGate, thinkingGates = {}, detailGate, failCommand, staleDefaults, backgroundReadGate, backgroundStateGate, agentReadGate, agentFullState, canonicalFailure, reselectLevel, effortReadGate, lostModelReply = false, hookImplementation = useAgentSession, renderImplementation = renderHook } = {}) {
   let catalog = {
     models: {}, modelList: [gpt, qwen, gemma].map(({ provider, modelId }) => ({ provider, id: modelId, name: modelId })),
     defaultModel: gpt, defaultThinkingLevel: defaults[key(gpt)] ?? "medium",
@@ -37,8 +38,10 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
       "local:gemma-4": ["off", "medium"],
     },
   };
-  const writes = [], commands = [], creations = [], prompts = [];
+  const writes = [], commands = [], creations = [], prompts = [], unexpected = [], reads = [];
   let serverModel = gpt, serverLevel = defaults[key(gpt)] ?? "medium";
+  let serverSupported;
+  const effortReads = [];
   let sessionTools = null;
   // Deliberately stale SDK settings: a live wrapper does not learn star writes by itself.
   const wrapperDefaults = { ...defaults, ...staleDefaults };
@@ -46,6 +49,7 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
   window.localStorage = { getItem: (k) => preferences.get(k) ?? null, setItem: (k, v) => preferences.set(k, v) };
   globalThis.fetch = async (url, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : null;
+    if (!body) reads.push(url);
     if (url === "/api/models/default") {
       writes.push(body);
       if (saveGate && body.modelThinkingLevel) await saveGate.promise;
@@ -80,21 +84,39 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
       if (backgroundReadGate && !url.includes("force=1") && !commands.some((command) => command.type === "set_model")) await backgroundReadGate.promise;
       return Response.json(detail);
     }
-    if (url === "/api/sessions/model-defaults/state") return Response.json({
-      running: false, state: { model: { provider: serverModel.provider, id: serverModel.modelId }, thinkingLevel: serverLevel },
-    });
+    if (url === "/api/sessions/model-defaults/state") {
+      const state = { model: { provider: serverModel.provider, id: serverModel.modelId }, thinkingLevel: serverLevel };
+      if (backgroundStateGate && !commands.some((command) => command.type === "set_model")) await backgroundStateGate.promise;
+      return Response.json({ running: false, state });
+    }
+    if (!body && (url === "/api/agent/model-defaults?systemPrompt=0" || url === "/api/agent/model-defaults")) {
+      const state = { model: { provider: serverModel.provider, id: serverModel.modelId }, thinkingLevel: serverLevel,
+        ...(url === "/api/agent/model-defaults" ? agentFullState : {}) };
+      if (agentReadGate && url === "/api/agent/model-defaults") await agentReadGate.promise;
+      if (url.endsWith("?systemPrompt=0") && commands.some((c) => c.type === "set_model")
+        && commands.at(-1)?.type === "set_thinking_level") {
+        effortReads.push(state);
+        if (effortReadGate) await effortReadGate.promise;
+      }
+      return Response.json({ running: false, state });
+    }
     if (url === "/api/agent/model-defaults" && body) {
       commands.push(body);
       if (body.type === failCommand) throw new Error(`fixture failure: ${failCommand}`);
       let data = {};
       if (body.type === "set_model") {
+        const sameModel = serverModel.provider === body.provider && serverModel.modelId === body.modelId;
         serverModel = { provider: body.provider, modelId: body.modelId };
-        serverLevel = wrapperDefaults[key(serverModel)] ?? fallback ?? serverLevel;
+        serverLevel = sameModel ? (reselectLevel ?? serverLevel) : (wrapperDefaults[key(serverModel)] ?? fallback ?? serverLevel);
+        // Simulate a saved definition that no longer reasons: the SDK clamps
+        // every later effort write too, not just the set_model response.
+        serverSupported = sameModel && reselectLevel === "off" ? ["off"] : undefined;
         data = { provider: body.provider, id: body.modelId };
         if (modelGate) await modelGate.promise;
+        if (lostModelReply) throw new Error("fixture lost model reply");
       }
       if (body.type === "set_thinking_level") {
-        serverLevel = body.level; data = null;
+        serverLevel = clampSupportedThinkingLevel(body.level, serverSupported); data = null;
         if (thinkingGates[body.level]) await thinkingGates[body.level].promise;
       }
       if (body.type === "prompt") prompts.push({ model: serverModel, level: serverLevel });
@@ -102,15 +124,22 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
       if (body.type === "get_tools") data = (sessionTools ?? ["read", "bash", "edit", "write"]).map((name) => ({ name, active: true }));
       return Response.json({ success: true, data });
     }
+    unexpected.push(`${init.method ?? "GET"} ${url}`);
     throw new Error(`unexpected fetch ${url}`);
   };
   const props = existing ? { session: { id: "model-defaults", cwd: "/project" } }
     : { session: null, newSessionCwd: "/project", newSessionDraftKey: "new:defaults" };
   let systemInfoLoader;
-  const hook = renderHook(useAgentSession, { ...props, onSystemInfoLoaderChange: (loader) => { systemInfoLoader = loader; } });
+  const choices = [];
+  const hook = renderImplementation(hookImplementation, { ...props,
+    onSystemInfoLoaderChange: (loader) => { systemInfoLoader = loader; },
+    onNewSessionChoicesChange: (value) => choices.push(value),
+  });
+  const unmount = hook.unmount;
+  hook.unmount = () => { unmount(); assert.deepEqual(unexpected, [], "hook must not swallow mock URL mismatches"); };
   await settle(); hook.flush();
   const events = globalThis.EventSource.latest;
-  return { hook, writes, commands, creations, preferences, prompts, initialize: () => systemInfoLoader(), catalog: () => catalog, serverLevel: () => serverLevel,
+  return { hook, writes, commands, creations, preferences, prompts, reads, choices, effortReads, initialize: () => systemInfoLoader(), catalog: () => catalog, serverLevel: () => serverLevel,
     emit: (event) => events.onmessage({ data: JSON.stringify(event) }) };
 }
 
@@ -387,6 +416,307 @@ test("later explicit effort wins over an existing model switch whose response is
     assert.ok(!hook.result.notices.some((notice) => notice.type === "error"));
   } finally { modelGate.resolve(); explicitGate.resolve(); hook.unmount(); }
 });
+
+test("same-id reselect keeps an uninitialized draft and its temporary effort without creating a wrapper", async () => {
+  const { hook, commands, creations, writes } = await setup();
+  try {
+    await hook.result.handleThinkingLevelChange("xhigh"); hook.flush();
+    await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "xhigh");
+    assert.equal(hook.result.modelSwitching, false);
+    assert.deepEqual(commands, []);
+    assert.deepEqual(creations, []);
+    assert.deepEqual(writes, []);
+  } finally { hook.unmount(); }
+});
+
+test("reselecting an initialized automatic draft does not invent an explicit effort to carry across folders", async () => {
+  const { hook, initialize, choices } = await setup({ reselectLevel: "off" });
+  try {
+    await initialize(); hook.flush();
+    assert.equal(choices.at(-1).thinkingLevel, null);
+    await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "off");
+    assert.equal(choices.at(-1).thinkingLevel, null, "native clamp updates this wrapper, not the user's draft overrides");
+  } finally { hook.unmount(); }
+});
+
+for (const existing of [false, true]) {
+  for (const reselectLevel of [undefined, "off"]) {
+    test(`same-id refresh ${reselectLevel ? "adopts SDK clamp to off" : "preserves temporary effort"} (${existing ? "restored" : "initialized draft"})`, async () => {
+      const { hook, commands, creations, writes, initialize, serverLevel, reads } = await setup({ existing, reselectLevel });
+      try {
+        if (!existing) { await initialize(); hook.flush(); }
+        await hook.result.handleThinkingLevelChange("xhigh"); hook.flush();
+        const start = commands.length, readStart = reads.length, creationCount = creations.length;
+        await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+        assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }], "no default effort RPC: unchanged refresh adds no thinking entry");
+        assert.equal(creations.length, creationCount);
+        assert.equal(serverLevel(), reselectLevel ?? "xhigh");
+        assert.equal(hook.result.thinkingLevel, reselectLevel ?? "xhigh");
+        assert.equal(hook.result.savedDefaultThinkingLevel, "high", "reselect never changes this model's saved default");
+        assert.equal(hook.result.modelSwitching, false);
+        assert.ok(reads.slice(readStart).some((url) => url === "/api/sessions/model-defaults/state"));
+        assert.ok(!reads.slice(readStart).some((url) => url.includes("force=1")), "canonical validation must not evict the wrapper");
+        assert.deepEqual(writes, []);
+      } finally { hook.unmount(); }
+    });
+  }
+}
+
+for (const existing of [false, true]) {
+  test(`newer explicit effort wins through a delayed reselect and canonical read (${existing ? "restored" : "initialized draft"})`, async () => {
+    const modelGate = Promise.withResolvers(), detailGate = Promise.withResolvers(), explicitGate = Promise.withResolvers();
+    const { hook, commands, initialize, serverLevel } = await setup({ existing, modelGate, detailGate, thinkingGates: { low: explicitGate } });
+    try {
+      if (!existing) { await initialize(); hook.flush(); }
+      const start = commands.length;
+      const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+      assert.equal(hook.result.modelSwitching, true);
+      await hook.result.handleModelChange(gpt.provider, gpt.modelId);
+      const choosing = hook.result.handleThinkingLevelChange("low"); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "low");
+      assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }], "duplicate refreshes are suppressed; explicit effort waits on the flight");
+      modelGate.resolve(); await settle(); hook.flush();
+      assert.equal(hook.result.modelSwitching, true, "flight includes canonical validation");
+      assert.equal(hook.result.thinkingLevel, "low");
+      detailGate.resolve(); await refreshing; await settle(); hook.flush();
+      assert.equal(hook.result.modelSwitching, false);
+      assert.equal(hook.result.thinkingLevel, "low", "old canonical high must not flash while explicit low is unacknowledged");
+      assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }, { type: "set_thinking_level", level: "low" }]);
+      explicitGate.resolve(); await choosing; hook.flush();
+      assert.equal(serverLevel(), "low");
+      assert.equal(hook.result.thinkingLevel, "low");
+    } finally { modelGate.resolve(); detailGate.resolve(); explicitGate.resolve(); hook.unmount(); }
+  });
+}
+
+async function queuedClampScenario({ existing, hookImplementation, renderImplementation } = {}) {
+  const modelGate = Promise.withResolvers(), detailGate = Promise.withResolvers(), explicitGate = Promise.withResolvers();
+  const state = await setup({ existing, reselectLevel: "off", modelGate, detailGate,
+    thinkingGates: { low: explicitGate }, hookImplementation, renderImplementation });
+  const { hook, initialize, commands, serverLevel, choices, effortReads } = state;
+  try {
+    if (!existing) { await initialize(); hook.flush(); }
+    const start = commands.length;
+    const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId);
+    const choosing = hook.result.handleThinkingLevelChange("low"); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "low");
+    modelGate.resolve(); await settle(); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "low", "canonical clamp must not hide the unacknowledged explicit pick");
+    detailGate.resolve(); await refreshing; await settle(); hook.flush();
+    assert.equal(serverLevel(), "off", "the actual effort write must clamp low too");
+    assert.equal(hook.result.thinkingLevel, "low", "keep optimism until the effort acknowledgement");
+    assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }, { type: "set_thinking_level", level: "low" }]);
+    explicitGate.resolve(); await choosing; hook.flush();
+    return { level: hook.result.thinkingLevel, native: serverLevel(), draftEffort: choices.at(-1)?.thinkingLevel, effortReads: effortReads.length };
+  } finally { modelGate.resolve(); detailGate.resolve(); explicitGate.resolve(); hook.unmount(); }
+}
+
+for (const existing of [false, true]) {
+  test(`queued low converges to SDK off after same-id capability refresh (${existing ? "restored" : "initialized draft"})`, async () => {
+    const result = await queuedClampScenario({ existing });
+    assert.equal(result.native, "off");
+    assert.equal(result.level, "off");
+    if (!existing) assert.equal(result.draftEffort, "off", "the draft's higher-priority explicit effort must also converge");
+    assert.equal(result.effortReads, 1, "only the effort that waited for a model flight needs canonical confirmation");
+  });
+}
+
+test("superseded effort picks waiting on the same flight never write or clear the newest pick", async () => {
+  const modelGate = Promise.withResolvers();
+  const { hook, commands, serverLevel } = await setup({ existing: true, reselectLevel: "off", modelGate });
+  try {
+    const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId);
+    const older = hook.result.handleThinkingLevelChange("low");
+    const newer = hook.result.handleThinkingLevelChange("off"); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "off");
+    modelGate.resolve(); await Promise.all([refreshing, older, newer]); hook.flush();
+    assert.deepEqual(commands.filter((command) => command.type === "set_thinking_level"), [{ type: "set_thinking_level", level: "off" }]);
+    assert.equal(hook.result.thinkingLevel, serverLevel());
+  } finally { modelGate.resolve(); hook.unmount(); }
+});
+
+test("a queued effort confirmation cannot clear a newer unacknowledged effort on the same model", async () => {
+  const modelGate = Promise.withResolvers(), effortReadGate = Promise.withResolvers(), explicitGate = Promise.withResolvers();
+  const { hook, effortReads } = await setup({ existing: true, reselectLevel: "off", modelGate, effortReadGate, thinkingGates: { xhigh: explicitGate } });
+  try {
+    const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId);
+    const older = hook.result.handleThinkingLevelChange("low");
+    modelGate.resolve(); await refreshing; await settle();
+    assert.equal(effortReads.length, 1);
+    const newer = hook.result.handleThinkingLevelChange("xhigh"); await settle(); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "xhigh");
+    effortReadGate.resolve(); await older; hook.flush();
+    assert.equal(hook.result.thinkingLevel, "xhigh", "changeId, not a newer write floor, protects the unacknowledged override");
+    explicitGate.resolve(); await newer;
+  } finally { modelGate.resolve(); effortReadGate.resolve(); explicitGate.resolve(); hook.unmount(); }
+});
+
+test("negative control: trusting the queued effort request leaves low despite the SDK's off clamp", async () => {
+  const source = readFileSync(new URL("./useAgentSession.ts", import.meta.url), "utf8");
+  const guard = "if (flight) {\n        // Reselect may have changed capabilities";
+  assert.ok(source.includes(guard));
+  const { useAgentSession: legacyHook, renderLegacyHook } = await jiti.evalModule(source.replace(guard, "if (false) {\n        // Reselect may have changed capabilities") + '\nexport { renderHook as renderLegacyHook } from "react";', {
+    filename: fileURLToPath(new URL("./__negative-queued-clamp.ts", import.meta.url)), forceTranspile: true, async: true,
+  });
+  for (const existing of [false, true]) {
+    const result = await queuedClampScenario({ existing, hookImplementation: legacyHook, renderImplementation: renderLegacyHook });
+    assert.equal(result.native, "off");
+    assert.equal(result.level, "low", "negative control demonstrates the original fictional effort");
+    if (!existing) assert.equal(result.draftEffort, "low");
+    assert.equal(result.effortReads, 0);
+  }
+});
+
+for (const existing of [false, true]) {
+  test(`a queued effort's delayed canonical read cannot clear a later model/explicit effort (${existing ? "restored" : "initialized draft"})`, async () => {
+    const modelGate = Promise.withResolvers(), effortReadGate = Promise.withResolvers(), explicitGate = Promise.withResolvers();
+    const { hook, initialize, effortReads } = await setup({ existing, modelGate, effortReadGate,
+      reselectLevel: "off", thinkingGates: { xhigh: explicitGate } });
+    try {
+      if (!existing) { await initialize(); hook.flush(); }
+      const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId);
+      const choosing = hook.result.handleThinkingLevelChange("low");
+      modelGate.resolve(); await refreshing; await settle(); hook.flush();
+      assert.equal(effortReads.length, 1);
+      await hook.result.handleModelChange(qwen.provider, qwen.modelId); hook.flush();
+      const newer = hook.result.handleThinkingLevelChange("xhigh"); await settle(); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "xhigh");
+      effortReadGate.resolve(); await choosing; hook.flush();
+      assert.deepEqual(hook.result.displayModel, qwen);
+      assert.equal(hook.result.thinkingLevel, "xhigh", "older canonical off must not clear the newer optimistic override");
+      explicitGate.resolve(); await newer; hook.flush();
+      assert.equal(hook.result.thinkingLevel, "xhigh");
+    } finally { modelGate.resolve(); effortReadGate.resolve(); explicitGate.resolve(); hook.unmount(); }
+  });
+}
+
+for (const canonicalFailure of [undefined, "http", "transport"]) {
+  test(`same-id confirmed-write floor rejects pre-reselect history after canonical ${canonicalFailure ?? "success"}`, async () => {
+    const backgroundReadGate = Promise.withResolvers();
+    const { hook, emit } = await setup({ existing: true, backgroundReadGate, canonicalFailure });
+    try {
+      emit({ type: "agent_start" }); emit({ type: "agent_end" });
+      await settle(); hook.flush();
+      await hook.result.handleThinkingLevelChange("xhigh"); hook.flush();
+      let finished = false;
+      const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId).then(() => { finished = true; });
+      await settle(); hook.flush();
+      assert.equal(finished, true, "reselect must not join the gated pre-write history flight");
+      assert.equal(hook.result.thinkingLevel, "xhigh");
+      backgroundReadGate.resolve(); await refreshing; await settle(); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "xhigh");
+      assert.equal(hook.result.modelSwitching, false);
+      if (canonicalFailure) assert.ok(hook.result.error, "a failed canonical read is not a silent success");
+    } finally { backgroundReadGate.resolve(); hook.unmount(); }
+  });
+}
+
+test("negative control: the old same-id guard swallows live refresh entirely", async () => {
+  const source = readFileSync(new URL("./useAgentSession.ts", import.meta.url), "utf8");
+  const guard = "if (displayModelRef.current?.provider === provider && displayModelRef.current?.modelId === modelId) {";
+  assert.ok(source.includes(guard));
+  const { useAgentSession: legacyHook, renderLegacyHook } = await jiti.evalModule(source.replace(guard, `${guard}\n      return; // Restore the old same-id no-op.`) + '\nexport { renderHook as renderLegacyHook } from "react";', {
+    filename: fileURLToPath(new URL("./__negative-reselect-guard.ts", import.meta.url)), forceTranspile: true, async: true,
+  });
+  const { hook, commands, serverLevel } = await setup({ existing: true, reselectLevel: "off", hookImplementation: legacyHook, renderImplementation: renderLegacyHook });
+  try {
+    const start = commands.length;
+    await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+    assert.deepEqual(commands.slice(start), [], "negative control never reaches backend refresh");
+    assert.equal(serverLevel(), "high", "therefore the edited definition's native off clamp never arrives");
+  } finally { hook.unmount(); }
+});
+
+test("same-run settled history and a newer explicit effort do not discard agent_end's full prompt/extensions", async () => {
+  const agentReadGate = Promise.withResolvers();
+  const agentFullState = { systemPrompt: "finished prompt", extensionStatuses: [{ key: "done", text: "finished" }],
+    extensionWidgets: [{ key: "done", lines: ["finished"] }] };
+  const { hook, emit, reads } = await setup({ existing: true, agentReadGate, agentFullState });
+  const historyCount = () => reads.filter((url) => url.startsWith("/api/sessions/model-defaults?")).length;
+  try {
+    const before = historyCount();
+    emit({ type: "agent_start" }); emit({ type: "agent_end" }); await settle(); hook.flush();
+    assert.equal(historyCount(), before + 1, "agent_end's H finished while full-state F is gated");
+    await hook.result.handleThinkingLevelChange("low"); hook.flush();
+    emit({ type: "agent_settled" }); await settle(); hook.flush();
+    assert.equal(historyCount(), before + 2, "settlement's newer H2 finished on the same logical run");
+    assert.equal(hook.result.thinkingLevel, "low");
+    assert.equal(hook.result.systemPrompt, null);
+    agentReadGate.resolve(); await settle(); hook.flush();
+    assert.equal(hook.result.systemPrompt, "finished prompt");
+    assert.deepEqual(hook.result.extensionStatuses, agentFullState.extensionStatuses);
+    assert.deepEqual(hook.result.extensionWidgets, agentFullState.extensionWidgets);
+    assert.equal(hook.result.thinkingLevel, "low", "F's old high must not undo the acknowledged explicit effort");
+  } finally { agentReadGate.resolve(); hook.unmount(); }
+});
+
+for (const lostModelReply of [false, true]) {
+  test(`an old agent_end full-state reply cannot undo a reselect's confirmed SDK clamp (${lostModelReply ? "lost ack" : "acknowledged"})`, async () => {
+    const agentReadGate = Promise.withResolvers();
+    const { hook, emit } = await setup({ existing: true, agentReadGate, reselectLevel: "off", lostModelReply });
+    try {
+      emit({ type: "agent_start" }); emit({ type: "agent_end" });
+      await settle(); hook.flush();
+      await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "off");
+      agentReadGate.resolve(); await settle(); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "off");
+    } finally { agentReadGate.resolve(); hook.unmount(); }
+  });
+}
+
+test("an old state reply cannot undo a reselect's confirmed SDK clamp", async () => {
+  const backgroundStateGate = Promise.withResolvers();
+  const { hook } = await setup({ existing: true, backgroundStateGate, reselectLevel: "off" });
+  try {
+    await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "off");
+    backgroundStateGate.resolve(); await settle(); hook.flush();
+    assert.equal(hook.result.thinkingLevel, "off");
+  } finally { backgroundStateGate.resolve(); hook.unmount(); }
+});
+
+for (const lostModelReply of [false, true]) {
+  for (const existing of [false, true]) {
+    test(`failed same-id refresh reconciles actual effort (${existing ? "restored" : "initialized draft"}, ${lostModelReply ? "lost ack after clamp" : "refused"})`, async () => {
+      const { hook, initialize, commands, serverLevel } = await setup({
+        existing, lostModelReply, failCommand: lostModelReply ? undefined : "set_model", reselectLevel: "off",
+      });
+      try {
+        if (!existing) { await initialize(); hook.flush(); }
+        await hook.result.handleThinkingLevelChange("xhigh"); hook.flush();
+        const start = commands.length;
+        await hook.result.handleModelChange(gpt.provider, gpt.modelId); hook.flush();
+        assert.equal(hook.result.modelSwitching, false);
+        assert.equal(hook.result.thinkingLevel, lostModelReply ? "off" : "xhigh");
+        assert.equal(hook.result.thinkingLevel, serverLevel());
+        assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }]);
+        assert.ok(hook.result.notices.some((notice) => notice.type === "error"));
+      } finally { hook.unmount(); }
+    });
+  }
+}
+
+for (const existing of [false, true]) {
+  test(`a failed reselect cancels its waiting effort RPC and reconciles the actual clamp (${existing ? "restored" : "initialized draft"})`, async () => {
+    const modelGate = Promise.withResolvers();
+    const { hook, initialize, commands } = await setup({ existing, lostModelReply: true, reselectLevel: "off", modelGate });
+    try {
+      if (!existing) { await initialize(); hook.flush(); }
+      const start = commands.length;
+      const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId);
+      const choosing = hook.result.handleThinkingLevelChange("low"); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "low");
+      modelGate.resolve(); await Promise.all([refreshing, choosing]); hook.flush();
+      assert.equal(hook.result.thinkingLevel, "off", "a cancelled low RPC must not leave low on screen");
+      assert.equal(hook.result.modelSwitching, false);
+      assert.deepEqual(commands.slice(start), [{ type: "set_model", ...gpt }]);
+      assert.ok(hook.result.notices.some((notice) => notice.type === "error"));
+    } finally { modelGate.resolve(); hook.unmount(); }
+  });
+}
 
 test("a model switch during creation owns the displayed effort and completes before the pending first prompt", async () => {
   for (const prompting of [false, true]) {

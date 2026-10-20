@@ -14,7 +14,7 @@ import type {
 } from "@/lib/types";
 import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
-import { isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
+import { agentStatusUrl, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import {
   deleteSessionViewSnapshot,
   getSessionViewSnapshot,
@@ -458,6 +458,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const newSessionPromotedRef = useRef(false);
   const newSessionModelOverrideRef = useRef<SelectedModel | null>(initialChoices?.model ?? null);
   const thinkingLevelOverrideRef = useRef<ConcreteThinkingLevel | null>(initialChoices?.thinkingLevel ?? null);
+  const thinkingLevelChangeIdRef = useRef(0);
   const thinkingLevelPinsRef = useRef<Record<string, string>>({});
   const modelThinkingDefaultsRef = useRef<Record<string, string>>({});
   const modelThinkingLevelsRef = useRef<Record<string, string[]>>({});
@@ -667,7 +668,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const runId = promptRunIdRef.current;
     const requestId = ++contextUsageRequestIdRef.current;
     try {
-      const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+      const res = await fetch(agentStatusUrl(sid));
       if (!res.ok) return;
       const data = await res.json() as { state?: AgentStateResponse };
       applyContextUsage(data.state, sid, runId, requestId);
@@ -1289,7 +1290,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ) return;
 
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        const res = await fetch(agentStatusUrl(sid));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
         if (
@@ -1365,7 +1366,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
       if (runId !== undefined && promptRunIdRef.current !== runId) return;
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        const res = await fetch(agentStatusUrl(sid));
         if (res.ok) {
           const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
           const state = data.state;
@@ -1393,7 +1394,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     ) {
       await delay(BASH_STATE_RECONCILE_MS);
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        const res = await fetch(agentStatusUrl(sid));
         if (!res.ok) continue;
         const data = await res.json() as { state?: AgentStateResponse };
         syncLiveModel(data.state);
@@ -1419,18 +1420,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const reconcileAgentState = useCallback(async (sid: string) => {
     if (!agentRunningRef.current || sessionIdRef.current !== sid) return;
     const runId = promptRunIdRef.current;
+    const generation = sessionMountGenerationRef.current;
+    const settingsReadId = ++sessionReadIdRef.current;
     const usageRequestId = ++contextUsageRequestIdRef.current;
     try {
-      const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+      const res = await fetch(agentStatusUrl(sid));
       if (!res.ok) return;
       const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
       // A slow response can straddle a run boundary (previous run finished
       // and the user already started the next one while this request was in
       // flight) — everything in it is stale, drop it.
-      if (sessionIdRef.current !== sid || promptRunIdRef.current !== runId) return;
+      if (!sessionHookMountedRef.current || sessionMountGenerationRef.current !== generation
+        || sessionIdRef.current !== sid || promptRunIdRef.current !== runId) return;
       const state = data.state;
       applyContextUsage(state, sid, runId, usageRequestId);
-      syncLiveModel(state);
+      if (settingsReadId > sessionSettingsReadFloorRef.current
+        && settingsReadId >= sessionReadAppliedIdRef.current) syncLiveModel(state);
       // Mirror compaction state unconditionally: a missed compaction_end
       // would otherwise leave the "Stop compaction" UI stuck. No state
       // (wrapper destroyed) means nothing is compacting.
@@ -1446,9 +1451,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (!agentRunningRef.current) return;
       if (state) {
-        if (state.systemPrompt !== undefined) setSystemPrompt(state.systemPrompt ?? null);
         if (state.extensionStatuses !== undefined) setExtensionStatuses(state.extensionStatuses ?? []);
         if (state.extensionWidgets !== undefined) setExtensionWidgets(state.extensionWidgets ?? []);
+        // The poll leaves the prompt out: read the one the run ended with once, as agent_end does.
+        fetch(`/api/agent/${encodeURIComponent(sid)}`)
+          .then((r) => r.ok ? r.json() : null)
+          .then((d: { state?: AgentStateResponse } | null) => {
+            if (!d || !sessionHookMountedRef.current || sessionMountGenerationRef.current !== generation
+              || sessionIdRef.current !== sid || promptRunIdRef.current !== runId) return;
+            if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
+          })
+          .catch(() => {});
       }
       await finishPromptWithoutStream(sid, runId);
     } catch {
@@ -1529,13 +1542,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (sessionIdRef.current) {
           const sid = sessionIdRef.current;
           const runId = promptRunIdRef.current;
+          const generation = sessionMountGenerationRef.current;
           const usageRequestId = ++contextUsageRequestIdRef.current;
           loadSession(sid);
+          const settingsReadId = ++sessionReadIdRef.current;
           fetch(`/api/agent/${encodeURIComponent(sid)}`)
             .then((r) => r.ok ? r.json() : null)
             .then((d: { state?: AgentStateResponse } | null) => {
-              if (!d || !sessionHookMountedRef.current || sessionIdRef.current !== sid || promptRunIdRef.current !== runId) return;
-              syncLiveModel(d.state);
+              if (!d || !sessionHookMountedRef.current || sessionMountGenerationRef.current !== generation
+                || sessionIdRef.current !== sid || promptRunIdRef.current !== runId) return;
+              // A newer history read has no prompt or extension state. Only
+              // model/effort shares its settings ordering; usage has its own.
+              if (settingsReadId > sessionSettingsReadFloorRef.current
+                && settingsReadId >= sessionReadAppliedIdRef.current) syncLiveModel(d.state);
               applyContextUsage(d.state, sid, runId, usageRequestId);
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
               if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
@@ -2018,8 +2037,63 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
     if (modelSwitchPendingRef.current) return;
-    if (displayModelRef.current?.provider === provider && displayModelRef.current?.modelId === modelId) return;
     const target = { provider, modelId };
+    if (displayModelRef.current?.provider === provider && displayModelRef.current?.modelId === modelId) {
+      // Reselect rebinds saved definitions, not this model's default effort.
+      // A fresh, uninitialized draft must stay a draft (no ensure_session).
+      const sid = sessionIdRef.current;
+      if (!sid) return;
+      const generation = sessionMountGenerationRef.current;
+      const effortChangeId = thinkingLevelChangeIdRef.current;
+      const previousDraftEffort = thinkingLevelOverrideRef.current;
+      const isCurrent = () => sessionHookMountedRef.current && sessionIdRef.current === sid
+        && sessionMountGenerationRef.current === generation;
+      modelSwitchPendingRef.current = true;
+      setModelSwitching(true);
+      const flight = (async () => {
+        let succeeded = true;
+        try {
+          await sendAgentCommand(sid, { type: "set_model", provider, modelId });
+          sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
+        } catch (e) {
+          succeeded = false;
+          if (isCurrent()) addNotice({ type: "error", message: `Failed to switch model: ${e instanceof Error ? e.message : String(e)}` });
+        }
+        // Even a lost write reply may have changed capabilities. Read fresh
+        // canonical state, including native off, without evicting the wrapper.
+        const canonical = await loadSession(sid, false, true, { fresh: true }) as { state?: AgentStateResponse } | null | "error";
+        if (isCurrent() && (thinkingLevelChangeIdRef.current === effortChangeId || !succeeded)) {
+          // A failed flight cancels its waiting effort RPC too: discard that
+          // optimistic choice and reconcile instead of leaving a fictional level.
+          if (isNew) {
+            const actual = canonical && canonical !== "error" ? asConcreteThinkingLevel(canonical.state?.thinkingLevel) : null;
+            if (actual !== null) {
+              if (thinkingLevelOverrideRef.current !== null) {
+                thinkingLevelOverrideRef.current = actual;
+                setNewSessionThinkingLevel(actual);
+              }
+              setNewSessionDefaultThinkingLevel(actual);
+            } else if (!succeeded) {
+              thinkingLevelOverrideRef.current = previousDraftEffort;
+              setNewSessionThinkingLevel(previousDraftEffort);
+            }
+          }
+          setCurrentThinkingOverride(null);
+        }
+        return succeeded;
+      })();
+      modelSwitchFlightRef.current = flight;
+      try {
+        await flight;
+      } finally {
+        if (modelSwitchFlightRef.current === flight) {
+          modelSwitchFlightRef.current = null;
+          modelSwitchPendingRef.current = false;
+          if (sessionHookMountedRef.current) setModelSwitching(false);
+        }
+      }
+      return;
+    }
     const supported = modelThinkingLevelsRef.current[`${provider}:${modelId}`];
     const preferred = modelThinkingDefault(target, thinkingLevelPinsRef.current,
       modelThinkingDefaultsRef.current, defaultThinkingLevelRef.current, supported)
@@ -2492,6 +2566,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [opts.chatInputRef, addNotice]);
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
+    const changeId = ++thinkingLevelChangeIdRef.current;
+    const generation = sessionMountGenerationRef.current;
+    const initialSid = sessionIdRef.current;
+    const isCurrent = () => sessionHookMountedRef.current
+      && sessionMountGenerationRef.current === generation && thinkingLevelChangeIdRef.current === changeId;
     if (level === "auto") {
       thinkingLevelOverrideRef.current = null;
       setNewSessionThinkingLevel(null);
@@ -2504,21 +2583,44 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } else {
       setCurrentThinkingOverride(level);
     }
-    if (await modelSwitchFlightRef.current === false) return;
+    const flight = modelSwitchFlightRef.current;
+    if (await flight === false || !isCurrent()) return;
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
-    if (!sid) return;
+    if (!sid || !isCurrent() || (initialSid !== null && initialSid !== sid)) return;
     try {
       await sendAgentCommand(sid, { type: "set_thinking_level", level });
-      if (sessionHookMountedRef.current && sessionIdRef.current === sid) {
-        sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
-        setLiveThinkingLevel(level);
-        setCurrentThinkingOverride(null);
+      if (!sessionHookMountedRef.current || sessionMountGenerationRef.current !== generation
+        || sessionIdRef.current !== sid) return;
+      sessionSettingsReadFloorRef.current = sessionReadIdRef.current;
+      if (!isCurrent()) return;
+      let actual: ConcreteThinkingLevel | null = level;
+      if (flight) {
+        // Reselect may have changed capabilities since the menu was loaded.
+        // The effort RPC returns null, so confirm the SDK clamp, not our pick.
+        // Do not use loadSession: its history update can clear a newer override.
+        const settingsReadId = ++sessionReadIdRef.current;
+        const res = await fetch(agentStatusUrl(sid));
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json() as { state?: AgentStateResponse };
+        if (!isCurrent() || sessionIdRef.current !== sid
+          || settingsReadId <= sessionSettingsReadFloorRef.current
+          || settingsReadId < sessionReadAppliedIdRef.current) return;
+        actual = asConcreteThinkingLevel(data.state?.thinkingLevel);
+        if (actual === null) return;
+        sessionReadAppliedIdRef.current = settingsReadId;
+        syncLiveModel(data.state);
+        if (isNew) {
+          thinkingLevelOverrideRef.current = actual;
+          setNewSessionThinkingLevel(actual);
+        }
       }
+      setLiveThinkingLevel(actual);
+      setCurrentThinkingOverride(null);
     } catch (e) {
       console.error("Failed to set thinking level:", e);
-      setCurrentThinkingOverride(null);
+      if (isCurrent() && sessionIdRef.current === sid) setCurrentThinkingOverride(null);
     }
-  }, [isNew]);
+  }, [isNew, syncLiveModel]);
 
   const handleSetDefaultThinkingLevel = useCallback(async (level: ConcreteThinkingLevel) => {
     const target = displayModelRef.current;
