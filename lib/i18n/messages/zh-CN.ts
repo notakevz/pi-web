@@ -834,6 +834,7 @@ export const zhCNLocale: LocalePlugin = {
     "chat.dismissCompactError": "关闭压缩错误",
     "chat.stopAgent": "停止 Agent",
     "chat.stop": "停止",
+    "chat.stopping": "正在停止…",
     "chat.disableSound": "关闭完成提示音",
     "chat.enableSound": "开启完成提示音",
     "chat.thinkingUseDefault": "使用 pi 默认设置",

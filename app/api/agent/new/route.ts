@@ -85,7 +85,10 @@ export async function POST(req: Request) {
       });
     }
 
-    const result = await session.send(promptCommand);
+    const result = await session.send({
+      ...promptCommand,
+      ...(promptCommand.type === "prompt" && toolNames !== undefined ? { toolNames } : {}),
+    });
     promptAccepted = promptCommand.type === "prompt";
 
     return NextResponse.json({

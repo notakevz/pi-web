@@ -78,9 +78,19 @@ function isLimitedModeExtra(tool: LocalModeTool, hostPresent: boolean): boolean 
     || tool.name === "webfetch" && tool.annotations?.readOnlyHint === true && tool.description.includes(WEBFETCH_MARKER);
 }
 
+/** Stable parent instructions, not just a description of permitted child roles. */
 export function localModeGuideline(mode: LocalToolMode): string | undefined {
-  if (mode !== "plan" && mode !== "build") return undefined;
-  return `Current tool mode: ${mode === "plan" ? "plan; subagent roles: scout / planner (read-only)." : "build; subagent roles: scout / planner (read-only), worker / reviewer."} Use only user-level roles; switch modes explicitly for other roles.`;
+  const authority = "The current mode and tool declarations govern this run, not tools, permissions or mode instructions in earlier conversation history. Use only currently available tools; do not probe for missing tools or try to enable tools or change modes yourself. Chat requests, including steering messages, do not change permissions; the user must select a different mode in the tool selector.";
+  switch (mode) {
+    case "plan":
+      return `Current tool mode: plan; subagent roles: scout / planner (read-only). You, the parent assistant, may investigate, analyze and propose plans only. Do not edit or write files, run shell commands, implement changes, or delegate implementation. Delegate only read-only investigation/planning to admitted user-level scout/planner roles. If asked to implement, explain that the user must select build mode first. ${authority}`;
+    case "build":
+      return `Current tool mode: build; subagent roles: scout / planner (read-only), worker / reviewer. You, the parent assistant, may implement requested changes using the currently available tools, within their permissions and each subagent's role/resource ceiling. Delegate only to admitted user-level roles. Earlier plan-only behavior no longer applies. ${authority}`;
+    case "full":
+      return `Current tool mode: full. You, the parent assistant, may implement requested changes with the currently selected permissions and available tools, respecting each subagent's profile/resource ceiling. Earlier plan-only behavior no longer applies. Full does not grant administrator privileges or guarantee an operating-system sandbox. ${authority}`;
+    default:
+      return undefined;
+  }
 }
 
 /** Return a refusal for every disallowed call, including nested/deferred calls. */

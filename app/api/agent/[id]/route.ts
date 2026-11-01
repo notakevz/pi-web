@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
-import { startRpcSession, getRpcSession, setRpcSessionTools } from "@/lib/rpc-manager";
+import { startRpcSession, getRpcSession, setRpcSessionTools, sendRpcSessionPrompt } from "@/lib/rpc-manager";
 import { cwdMissingBody, missingCwdFromBody } from "@/lib/missing-cwd";
+import { hasUnsettledSubagentRun } from "@/lib/subagent-runtime";
 
 // POST /api/agent/[id] - Send a command to an existing session
 export async function POST(
@@ -36,6 +37,15 @@ export async function POST(
         success: true,
         data: { sessionId: changed.sessionId, recreated: changed.recreated },
       });
+    }
+    if (body.type === "prompt" && toolNames !== undefined) {
+      const filePath = existing?.sessionFile || await resolveSessionPath(id) || undefined;
+      if (!existing?.isAlive() && !filePath) {
+        return NextResponse.json({ error: "Session not found", code: "prompt_rejected", accepted: false }, { status: 404 });
+      }
+      const result = await sendRpcSessionPrompt(id, filePath, body);
+      promptAccepted = true;
+      return NextResponse.json({ success: true, data: result });
     }
     if (existing?.isAlive()) {
       const result = await existing.send(body);
@@ -83,7 +93,7 @@ export async function GET(
   try {
     const session = getRpcSession(id);
     if (!session || !session.isAlive()) {
-      return NextResponse.json({ running: false });
+      return NextResponse.json({ running: false, subagentsActive: hasUnsettledSubagentRun(id) });
     }
 
     const state = await session.send({ type: "get_state" }) as Record<string, unknown>;

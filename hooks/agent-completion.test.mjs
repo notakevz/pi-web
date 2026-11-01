@@ -72,8 +72,8 @@ async function setup(t) {
   };
 }
 
-const activeSnapshot = { running: true, state: { isStreaming: true, isPromptRunning: true } };
-const idleSnapshot = { running: false, state: { isStreaming: false, isPromptRunning: false } };
+const activeSnapshot = { running: true, state: { isStreaming: true, isPromptRunning: true, subagentsActive: false } };
+const idleSnapshot = { running: false, state: { isStreaming: false, isPromptRunning: false, subagentsActive: false } };
 
 test("an injected SDK start during an idle history read cannot be cleared or announced by that finish", async (t) => {
   const env = await setup(t);
@@ -154,6 +154,13 @@ for (const outcome of [{ aborted: true }, { aborted: false, subagentsActive: tru
       await env.hook.result.handleSend("/ask first");
       await env.emit({ type: "agent_start" }, { type: "agent_settled", ...outcome }, { type: "prompt_done", ...outcome });
       assert.deepEqual(env.ended, [outcome]);
+      if (outcome.subagentsActive) {
+        // Ordinary sends are now blocked until the previous family is known idle.
+        env.setSnapshot(idleSnapshot);
+        await env.reconcile();
+        assert.equal(env.hook.result.subagentsActive, false);
+        assert.deepEqual(env.ended, [outcome], "family idle alone owes no new completion");
+      }
       // No lifecycle events reach the page for the next, successful run.
       await env.hook.result.handleSend("/ask next");
       env.disconnect();

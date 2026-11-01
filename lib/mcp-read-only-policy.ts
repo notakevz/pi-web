@@ -77,11 +77,21 @@ export function createSubagentMcpPolicyExtension(
 
 export function createReadOnlyMcpPolicyExtension(
   defaultTools: () => readonly string[] | undefined = () => undefined,
+  isStopping?: (sessionId: string) => boolean,
 ): InlineExtension {
   return {
     name: READ_ONLY_MCP_POLICY_EXTENSION_NAME,
     hidden: true,
     factory: (pi) => {
+      // A previous input handler can outlive Stop, before an SDK run is active.
+      // Consume that input through the supported gate, not a throwing
+      // before_agent_start hook (whose errors the SDK catches and continues).
+      // Register after other input handlers; direct custom triggers bypass input.
+      // The wrapper reports the stopped submission via its stop-epoch check.
+      pi.on("input", (_event, ctx) => {
+        if (isStopping?.(ctx.sessionManager.getSessionId()) === true) return { action: "handled" };
+        return undefined;
+      });
       pi.on("before_agent_start", (event, ctx) => {
         const policy = localToolPolicy(
           readSessionToolSelection(ctx.sessionManager.getEntries() as unknown as SessionEntry[]),
@@ -92,7 +102,17 @@ export function createReadOnlyMcpPolicyExtension(
         // that edit precedence over setActiveTools. Reassert both upstream paths.
         event.systemPromptOptions.selectedTools = pi.getActiveTools();
         const guideline = localModeGuideline(policy.mode);
-        if (guideline) event.systemPromptOptions.promptGuidelines.push(guideline);
+        if (guideline) {
+          // A replacement SYSTEM.md omits the SDK's rules section. Its custom
+          // sections still render, so keep the parent policy visible there too.
+          // Do not rewrite forceSystemPrompt: a trusted extension's exact prompt
+          // intentionally replaces all sections (as Chat-only/profiles require).
+          if (event.systemPromptOptions.customPrompt) {
+            event.systemPromptOptions.sections.pi_web_local_mode = guideline;
+          } else {
+            event.systemPromptOptions.promptGuidelines.push(guideline);
+          }
+        }
       });
       // Every call, not merely MCP: deferred/codemode tools remain callable
       // when undeclared. Custom-message-triggered runs also pass this guard.
