@@ -24,7 +24,6 @@ function setup({ transform } = {}) {
     sessionHookMountedRef: { current: true }, sessionMountGenerationRef: { current: 1 }, sessionIdRef: { current: "a" },
     promptRunIdRef: { current: 1 }, contextUsageRequestIdRef: { current: 0 }, contextUsageAppliedIdRef: { current: 0 },
     sessionReadIdRef: { current: 0 }, sessionReadAppliedIdRef: { current: 0 }, sessionSettingsReadFloorRef: { current: 0 },
-    stoppingRef: { current: false }, familyActivityEpochRef: { current: 0 }, subagentsActiveRef: { current: false },
     agentRunningRef: { current: true }, sdkAgentActiveRef: { current: true }, rpcPromptPendingRef: { current: true },
     agentRunNeedsCompletionRef: { current: true }, agentRunEndRef: { current: { aborted: false } },
     sdkAgentGenerationRef: { current: 0 }, notifiedPromptRunIdRef: { current: -1 },
@@ -34,9 +33,7 @@ function setup({ transform } = {}) {
     syncLiveModel: (state) => models.push(state), setIsCompacting() {}, setAutoCompactionEnabled() {}, setQueuedMessages() {},
     normalizeQueuedMessages: (value) => value, finishPromptWithoutStream: (...args) => settlements.push(args),
     setExtensionStatuses() {}, setExtensionWidgets() {}, setSystemPrompt: (prompt) => prompts.push(prompt),
-    setIsStopping() {}, setSubagentsActive() {},
   });
-  context.applyFamilyActivity = callback("applyFamilyActivity").runInContext(context);
   context.observeSdkAgentRun = callback("observeSdkAgentRun").runInContext(context);
   context.applyLiveUsage = callback("applyLiveUsage").runInContext(context);
   context.refreshContextUsage = callback("refreshContextUsage").runInContext(context);

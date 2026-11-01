@@ -457,7 +457,7 @@ test("the actual menu offers only plan/build/full with concise localized descrip
   ]) {
     const selected = [];
     const row = callback.runInNewContext({
-      React, TOOL_MODE_PRESETS, toolPreset: "none", isStreaming: false,
+      React, TOOL_MODE_PRESETS, toolPreset: "none",
       t: (key) => getLocalePlugin(locale).messages[key],
       setToolDropdownOpen() {}, onToolPresetChange: (preset) => selected.push(preset),
     });
@@ -483,7 +483,7 @@ test("the actual menu offers only plan/build/full with concise localized descrip
   })));
   const picked = [];
   const row = callback.runInNewContext({
-    React, TOOL_MODE_PRESETS, toolPreset, isStreaming: false, t: (key) => getLocalePlugin("en").messages[key],
+    React, TOOL_MODE_PRESETS, toolPreset, t: (key) => getLocalePlugin("en").messages[key],
     setToolDropdownOpen() {}, onToolPresetChange: (preset) => picked.push(preset),
   });
   row("build").props.onClick();
@@ -776,7 +776,7 @@ function chatInputCallback(name, context) {
   }
   return new Script(ts.transpileModule(findCallback(source).getText(source), {
     compilerOptions: { target: ts.ScriptTarget.ES2020 },
-  }).outputText).runInNewContext({ stoppingRef: { current: false }, ...context });
+  }).outputText).runInNewContext(context);
 }
 
 test("while a run streams, a bare /mcp opens Settings or is queued as before", async () => {

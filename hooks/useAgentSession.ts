@@ -114,8 +114,6 @@ type AgentStateResponse = {
   thinkingLevel?: string;
   isStreaming?: boolean;
   isPromptRunning?: boolean;
-  isStopping?: boolean;
-  subagentsActive?: boolean;
   isBashRunning?: boolean;
   isCompacting?: boolean;
   autoCompactionEnabled?: boolean;
@@ -446,20 +444,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [streamingStore] = useState(createStreamingStore);
   const dispatch = streamingStore.dispatch;
   const [agentRunning, setAgentRunning] = useState(false);
-  const [isStopping, setIsStopping] = useState(false);
-  const [subagentsActive, setSubagentsActive] = useState(false);
-  const subagentsActiveRef = useRef(false);
-  const familyActivityEpochRef = useRef(0);
-  const applyFamilyActivity = useCallback((active: unknown, epoch = familyActivityEpochRef.current) => {
-    if (typeof active !== "boolean" || epoch !== familyActivityEpochRef.current) return;
-    familyActivityEpochRef.current++;
-    subagentsActiveRef.current = active;
-    setSubagentsActive(active);
-  }, []);
-  const stoppingRef = useRef(false);
-  const abortPendingRef = useRef(false);
-  const stopGenerationRef = useRef(0);
-  const submissionPendingRef = useRef(false);
   const [bashRunning, setBashRunning] = useState(false);
   const [pendingBash, setPendingBash] = useState<{ command: string; excludeFromContext: boolean } | null>(null);
   const [modelNames, setModelNames] = useState<Record<string, string>>({});
@@ -830,19 +814,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const refreshContextUsage = useCallback(async (sid: string) => {
     const runId = promptRunIdRef.current;
     const requestId = ++contextUsageRequestIdRef.current;
-    const familyEpoch = familyActivityEpochRef.current;
     try {
       const res = await fetch(agentStatusUrl(sid));
       if (!res.ok) return;
-      const data = await res.json() as { state?: AgentStateResponse; subagentsActive?: boolean };
-      if (sessionHookMountedRef.current && sessionIdRef.current === sid && promptRunIdRef.current === runId) {
-        applyFamilyActivity(data.state?.subagentsActive ?? data.subagentsActive, familyEpoch);
-      }
+      const data = await res.json() as { state?: AgentStateResponse };
       applyLiveUsage(data.state, sid, runId, requestId);
     } catch {
       // A later message or the running-state poll retries the usage read.
     }
-  }, [applyFamilyActivity, applyLiveUsage]);
+  }, [applyLiveUsage]);
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean; fresh?: boolean }) => {
     // Single-flight: ordinary reads share a request. A model switch needs a
@@ -995,14 +975,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       try {
         const runId = promptRunIdRef.current;
         const usageRequestId = ++contextUsageRequestIdRef.current;
-        const familyEpoch = familyActivityEpochRef.current;
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
         if (!isCurrent()) return null;
 
         const liveState = agentState.state;
-        applyFamilyActivity(liveState?.subagentsActive, familyEpoch);
         syncLiveModel(liveState);
         if (liveState) {
           applyLiveUsage(liveState, sid, runId, usageRequestId);
@@ -1031,7 +1009,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (loadFlightsRef.current.get(flightKey) === flight) loadFlightsRef.current.delete(flightKey);
     });
     return await flight;
-  }, [applyFamilyActivity, applyLiveUsage, setToolPresetState, syncLiveModel]);
+  }, [applyLiveUsage, setToolPresetState, syncLiveModel]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null, before?: string | null, options?: { tail?: number; signal?: AbortSignal }) => {
     try {
@@ -1311,7 +1289,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const pending = leaseRequestRef.current;
     if (pending?.sid === sid) return pending.promise;
     const controller = new AbortController();
-    const familyEpoch = familyActivityEpochRef.current;
     const timeout = setTimeout(() => controller.abort(), SESSION_LEASE_TIMEOUT_MS);
     const request: { sid: string; promise: Promise<SessionLeaseOutcome> } = { sid, promise: Promise.resolve(null) };
     request.promise = (async (): Promise<SessionLeaseOutcome> => {
@@ -1324,9 +1301,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const response = await fetch(sessionLeaseUrl(sid), { method: "POST", cache: "no-store", signal: controller.signal });
         httpStatus = response.status;
         result = response.ok ? await response.json() as SessionLeaseReply : null;
-        if (result && sessionHookMountedRef.current && sessionIdRef.current === sid) {
-          applyFamilyActivity(result.subagentsActive, familyEpoch);
-        }
         return result;
       } catch (error) {
         // Timed out (queued behind open streams) or no network. A body that is no
@@ -1361,7 +1335,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     })();
     leaseRequestRef.current = request;
     return request.promise;
-  }, [applyFamilyActivity]);
+  }, []);
 
   // A page hidden for HIDDEN_PAGE_GRACE_MS lets go of the selected session's
   // stream while nothing needs it (#1283): each one holds a browser connection,
@@ -1374,7 +1348,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // dialog, a subagent whose end starts a turn here); the check repeats each
   // grace while hidden. A run that settles while hidden starts the grace again,
   // which also covers extension follow-ups right after prompt_done.
-  const eventStreamIdle = !agentRunning && !isStopping && !bashRunning && !isCompacting
+  const eventStreamIdle = !agentRunning && !bashRunning && !isCompacting
     && extensionDialogs.length === 0 && extensionCustomUis.length === 0;
   useEffect(() => {
     const sid = session?.id;
@@ -1793,17 +1767,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // If the server reports idle while we still think it's running, finish
   // through the same settlement path used by non-streaming prompts.
   const reconcileAgentState = useCallback(async (sid: string) => {
-    if ((!agentRunningRef.current && !subagentsActiveRef.current) || sessionIdRef.current !== sid) return;
+    if (!agentRunningRef.current || sessionIdRef.current !== sid) return;
     const runId = promptRunIdRef.current;
     const sdkGeneration = sdkAgentGenerationRef.current;
     const generation = sessionMountGenerationRef.current;
     const settingsReadId = ++sessionReadIdRef.current;
     const usageRequestId = ++contextUsageRequestIdRef.current;
-    const familyEpoch = familyActivityEpochRef.current;
     try {
       const res = await fetch(agentStatusUrl(sid));
       if (!res.ok) return;
-      const data = await res.json() as { running?: boolean; state?: AgentStateResponse; subagentsActive?: boolean };
+      const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
       // A slow response can straddle a run boundary (previous run finished
       // and the user already started the next one while this request was in
       // flight) — everything in it is stale, drop it.
@@ -1811,11 +1784,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         || sessionIdRef.current !== sid || promptRunIdRef.current !== runId
         || sdkAgentGenerationRef.current !== sdkGeneration) return;
       const state = data.state;
-      applyFamilyActivity(state?.subagentsActive ?? data.subagentsActive, familyEpoch);
-      if (state?.isStopping) {
-        stoppingRef.current = true;
-        setIsStopping(true);
-      }
       applyLiveUsage(state, sid, runId, usageRequestId);
       if (settingsReadId > sessionSettingsReadFloorRef.current
         && settingsReadId >= sessionReadAppliedIdRef.current) syncLiveModel(state);
@@ -1826,7 +1794,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAutoCompactionEnabled(state?.autoCompactionEnabled ?? true);
       setQueuedMessages(normalizeQueuedMessages(state?.queuedMessages));
       const busy = data.running && state
-        && (state.isStreaming || state.isPromptRunning || state.isCompacting || state.subagentsActive);
+        && (state.isStreaming || state.isPromptRunning || state.isCompacting);
       if (busy) {
         if (state.isStreaming) observeSdkAgentRun();
         rpcPromptPendingRef.current = Boolean(state.isPromptRunning);
@@ -1850,13 +1818,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch {
       // Network still down — the next poll / visibility / online tick retries.
     }
-  }, [applyFamilyActivity, applyLiveUsage, finishPromptWithoutStream, observeSdkAgentRun, syncLiveModel]);
+  }, [applyLiveUsage, finishPromptWithoutStream, observeSdkAgentRun, syncLiveModel]);
 
   // Recovery net for missed SSE events: while the agent is running, verify
   // against the server periodically and whenever the tab returns to the
   // foreground or the network comes back.
   useEffect(() => {
-    if (!agentRunning && !subagentsActive) return;
+    if (!agentRunning) return;
     const reconcile = () => {
       // Read the ref on every tick: for brand-new sessions the id is
       // assigned only after ensure_session returns.
@@ -1874,7 +1842,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("online", reconcile);
     };
-  }, [agentRunning, subagentsActive, reconcileAgentState]);
+  }, [agentRunning, reconcileAgentState]);
 
   useEffect(() => {
     agentRunningRef.current = agentRunning;
@@ -1954,7 +1922,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         break;
       case "agent_settled": {
-        applyFamilyActivity(event.subagentsActive);
         const agentWasActive = sdkAgentActiveRef.current;
         sdkAgentActiveRef.current = false;
         sdkAgentGenerationRef.current++;
@@ -1976,7 +1943,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       case "prompt_done":
         {
-          applyFamilyActivity(event.subagentsActive);
           markPromptLanded();
           const runId = promptRunIdRef.current;
           const promptWasPending = rpcPromptPendingRef.current;
@@ -2192,14 +2158,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setExtensionDialogs((queue) => removeExtensionUiRequest(queue, event.id as string));
         break;
     }
-  }, [addNotice, applyFamilyActivity, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, observeSdkAgentRun, onAgentEnd, onToolEnd, refreshContextUsage, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
+  }, [addNotice, applyLiveUsage, cancelEventStreamGrace, dispatch, handleExtensionUiRequest, loadSession, markPromptLanded, notifyPromptStage, observeSdkAgentRun, onAgentEnd, onToolEnd, refreshContextUsage, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const applyPromptAck = useCallback((sid: string, ack: { sessionId?: string; recreated?: boolean } | null | undefined, toolNames: string[] | undefined, sentPreset: ToolPreset | undefined) => {
     if (toolNames !== undefined) {
       sessionToolsPinnedRef.current = true;
-      // The server applied this draft inside the same prompt admission. A pick
-      // made while that submission was stopping belongs to the NEXT message:
+      // The server applied this draft inside the same prompt admission. A newer
+      // pick made while the ACK was in flight belongs to the NEXT message:
       // only clear the draft marker while the selection is still the sent one.
       if (toolPresetRef.current === sentPreset) toolPresetDirtyRef.current = false;
     }
@@ -2220,12 +2186,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
     const trimmedMessage = message.trim();
     if (!trimmedMessage && !images?.length) return;
-    if (stoppingRef.current || submissionPendingRef.current || agentRunningRef.current || subagentsActiveRef.current || bashRunningRef.current) {
+    if (agentRunningRef.current || bashRunningRef.current) {
       restoreSubmission(message, images, composerDraftKey);
       return;
     }
-    // Freeze synchronously, before navigation, creation, model or stream awaits.
-    const stopGeneration = stopGenerationRef.current;
     // Only a local mode change this draft has not confirmed is sent with the
     // prompt. An unchanged session keeps its own stored mode (and legacy sets
     // stay untouched), while a fresh session was already created with build.
@@ -2233,7 +2197,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const capturedToolNames = session?.relation?.kind === "subagent" || !toolPresetDirtyRef.current
       ? undefined
       : getToolNamesForPreset(capturedPreset);
-    submissionPendingRef.current = true;
     if (editEntryId) {
       // Navigate and prompt are two RPCs: a prompt rejected after navigating
       // keeps the new leaf until the server can apply both atomically.
@@ -2241,15 +2204,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setEdit(null);
       if (!(await handleNavigateRef.current?.(entryId))) {
         setEdit(entryId);
-        submissionPendingRef.current = false;
         restoreSubmission(message, images, composerDraftKey);
         return;
       }
-    }
-    if (stoppingRef.current || stopGeneration !== stopGenerationRef.current) {
-      submissionPendingRef.current = false;
-      restoreSubmission(message, images, composerDraftKey);
-      return;
     }
     const isSlashCommandPrompt = !images?.length && trimmedMessage.startsWith("/");
 
@@ -2258,15 +2215,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const isExcluded = trimmedMessage.startsWith("!!");
       const bashCmd = (isExcluded ? trimmedMessage.slice(2) : trimmedMessage.slice(1)).trim();
       if (!bashCmd) {
-        submissionPendingRef.current = false;
         restoreSubmission(message, images, composerDraftKey);
         return;
       }
-      try {
-        await executeBashRef.current?.(bashCmd, isExcluded);
-      } finally {
-        submissionPendingRef.current = false;
-      }
+      await executeBashRef.current?.(bashCmd, isExcluded);
       return;
     }
 
@@ -2331,7 +2283,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             if (sessionHookMountedRef.current) throw error;
           });
         }
-        if (stoppingRef.current || stopGeneration !== stopGenerationRef.current) throw new Error("Prompt stopped before submission");
         promptRequestStarted = true;
         const queuedAck = await sendAgentCommand<{ queued?: boolean; sessionId?: string; recreated?: boolean }>(sid, {
           type: "prompt",
@@ -2348,7 +2299,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           throw new Error("Model switch failed; please select the model again before sending.");
         }
         await ensureEventsConnected(session.id);
-        if (stoppingRef.current || stopGeneration !== stopGenerationRef.current) throw new Error("Prompt stopped before submission");
         promptRequestStarted = true;
         const queuedAck = await sendAgentCommand<{ queued?: boolean; sessionId?: string; recreated?: boolean }>(session.id, {
           type: "prompt",
@@ -2398,9 +2348,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // A folder that no longer exists never reached the model: the composer's
       // banner names it (translated) instead of the server's English notice.
       if (e instanceof AgentCommandError && e.missingCwd) setPromptMissingCwd(e.missingCwd);
-      else if (promptRequestStarted || stopGeneration === stopGenerationRef.current) {
-        addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
-      }
+      else addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
       restoreSubmission(message, images, composerDraftKey);
       optimisticUserMessageKeyRef.current = null;
       // Rejection only describes this submission. Another tab or an event we
@@ -2415,13 +2363,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentRunning(false);
       setAgentPhase(null);
       dispatch({ type: "end" });
-    } finally {
-      submissionPendingRef.current = false;
     }
   }, [applyPromptAck, isNew, newSessionCwd, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, releaseUnconfirmedSend, cancelEventStreamGrace, closeEvents, composerDraftKey, dispatch, reconcileAgentState, restoreSubmission, editEntryId, setEdit]);
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
-    if (stoppingRef.current || agentRunningRef.current || bashRunningRef.current) return;
+    if (agentRunningRef.current || bashRunningRef.current) return;
     const inputText = `${excludeFromContext ? "!!" : "!"}${command}`;
     bashRunningRef.current = true;
     setPendingBash({ command, excludeFromContext });
@@ -2455,79 +2401,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     else if (text) opts.chatInputRef?.current?.prependText(text);
   }, [composerDraftKey, opts.chatInputRef, restoreSubmission]);
 
-  const completeStop = useCallback(() => {
-    applyFamilyActivity(false);
-    stoppingRef.current = false;
-    setIsStopping(false);
-    bashRunningRef.current = false;
-    setBashRunning(false);
-    setPendingBash(null);
-    setIsCompacting(false);
-    settleUiStage();
-  }, [applyFamilyActivity, settleUiStage]);
-
   const handleAbort = useCallback(async () => {
-    if (stoppingRef.current) return;
-    stoppingRef.current = true;
-    stopGenerationRef.current++;
-    abortPendingRef.current = true;
-    setIsStopping(true);
-    let sid = sessionIdRef.current;
-    try {
-      sid ??= await ensuringNewSessionRef.current;
-      if (!sid) {
-        completeStop();
-        return;
-      }
-      // One authoritative whole-task stop, including bang bash and descendants.
-      // Stop recalls compaction queues without touching the newer draft.
-      restoreRecalledPrompts(await sendAgentCommand<RecalledPrompts | null>(sid, { type: "abort" }));
-      if (sessionHookMountedRef.current && sessionIdRef.current === sid) completeStop();
-    } catch (e) {
-      // A lost response is not completion. Only a subsequent read can unlock send.
-      console.error("Failed to abort:", e);
-    } finally {
-      abortPendingRef.current = false;
-    }
-  }, [completeStop, restoreRecalledPrompts]);
-
-  useEffect(() => {
-    if (!isStopping) return;
-    let disposed = false;
-    let reading = false;
-    const confirm = async () => {
-      const sid = sessionIdRef.current;
-      if (!sid || !stoppingRef.current || abortPendingRef.current || reading) return;
-      const stopGeneration = stopGenerationRef.current;
-      reading = true;
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    if (bashRunningRef.current) {
       try {
-        const res = await fetch(agentStatusUrl(sid));
-        if (!res.ok) return;
-        const result = await res.json() as { running?: boolean; state?: AgentStateResponse; subagentsActive?: boolean };
-        if (disposed || abortPendingRef.current || sessionIdRef.current !== sid
-          || stopGenerationRef.current !== stopGeneration) return;
-        const state = result.state;
-        const idle = (!state && result.running === false && result.subagentsActive === false) || Boolean(state
-          && state.isStopping === false && state.subagentsActive === false
-          && !state.isStreaming && !state.isPromptRunning && !state.isBashRunning && !state.isCompacting);
-        if (idle) completeStop();
-      } catch {
-        // Unknown stays disabled. Read-only retries never resend abort or prompt.
-      } finally {
-        reading = false;
+        await sendAgentCommand(sid, { type: "abort_bash" });
+      } catch (e) {
+        console.error("Failed to abort bash:", e);
       }
-    };
-    const interval = setInterval(() => void confirm(), 1000);
-    const onReturn = () => void confirm();
-    window.addEventListener("online", onReturn);
-    document.addEventListener("visibilitychange", onReturn);
-    return () => {
-      disposed = true;
-      clearInterval(interval);
-      window.removeEventListener("online", onReturn);
-      document.removeEventListener("visibilitychange", onReturn);
-    };
-  }, [isStopping, completeStop]);
+      return;
+    }
+    try {
+      // Prompts parked behind a compaction come back for the composer, as Recall's do.
+      restoreRecalledPrompts(await sendAgentCommand<RecalledPrompts | null>(sid, { type: "abort" }));
+    } catch (e) {
+      console.error("Failed to abort:", e);
+    }
+  }, [restoreRecalledPrompts]);
 
   const handleFork = useCallback(async (entryId: string) => {
     if (bashRunningRef.current) return;
@@ -3058,13 +2949,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   ) => {
     const sid = sessionIdRef.current;
     const restore = () => restoreSubmission(message, images, composerDraftKey);
-    // Stop blocks every submission path, including stale/programmatic handlers.
-    // A plain prompt's own admission window must not swallow a Steer/Follow-up:
-    // the backend queues those into the running turn; only Stop is a barrier here.
-    if (stoppingRef.current) {
-      restore();
-      return;
-    }
     // A pending history edit must branch when sent, never join the current run.
     if (editEntryId) {
       restore();
@@ -3218,7 +3102,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleToolPresetChange = useCallback((preset: ToolPreset) => {
     if (session?.relation?.kind === "subagent"
-      || (!stoppingRef.current && (submissionPendingRef.current || agentRunningRef.current || subagentsActiveRef.current || bashRunningRef.current))) return;
+      || agentRunningRef.current || bashRunningRef.current) return;
     toolPresetDirtyRef.current = true;
     toolPresetRef.current = preset;
     setToolPresetState(preset);
@@ -3296,10 +3180,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // mount and a hidden page's return show it the same way.
   const applyLoadedAgentState = useCallback((sid: string, loadedAgentState: unknown) => {
     const agentState = loadedAgentState as { running: boolean; state?: AgentStateResponse } | null;
-    if (agentState?.state?.isStopping) {
-      stoppingRef.current = true;
-      setIsStopping(true);
-    }
     if (agentState?.running) {
       loadTools(sid);
       if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
@@ -3552,7 +3432,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => onDebugSnapshotReaderChange?.(null);
   }, [readDebugSnapshot, onDebugSnapshotReaderChange]);
 
-  const branchSwitchLocked = agentRunning || subagentsActive || isStopping || bashRunning || isCompacting;
+  const branchSwitchLocked = agentRunning || bashRunning || isCompacting;
   useEffect(() => {
     if (!onBranchDataChange) return;
     onBranchDataChange(data?.tree ?? [], activeLeafId, handleLeafChange, branchSwitchLocked);
@@ -3679,7 +3559,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, activeToolResults, entryIds, messageKeys, historyCursor, hasEarlierMessages, earlierTurnCount, streamingStore,
-    agentRunning, isStopping, subagentsActive, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
+    agentRunning, modelNames, modelList, modelError, missingCwd, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,
     slashCommands, slashCommandsLoading, queuedMessages,

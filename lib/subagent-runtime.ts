@@ -7,7 +7,6 @@ import {
   SettingsManager,
   type ModelRuntime,
   type ExtensionContext,
-  type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike } from "./pi-types";
 import { createLocalSubagentServices } from "./local-subagent-services";
@@ -63,8 +62,6 @@ interface HostSession {
   readonly cwd: string;
   isAlive(): boolean;
   isRunning(): boolean;
-  /** Host Stop's synchronous admission barrier, not a foreground tool wait's signal. */
-  isStopping?(): boolean;
   waitUntilReady(): Promise<void>;
   /**
    * Connect the session's MCP servers before a run prompts the SDK session directly, past the
@@ -90,16 +87,12 @@ export interface SubagentController {
   get(sessionId: string): Promise<SubagentRunInfo | null>;
   steer(sessionId: string, message: string, parentContext?: ExtensionContext): Promise<void>;
   abort(sessionId: string): Promise<void>;
-  /** Host Stop's descendant broadcast/unwind; abort the owner's SDK session concurrently. */
-  abortFamily(sessionId: string): Promise<void>;
 }
 
 type StoredSubagentExecution = {
   run: SubagentRunInfo;
   completion: Promise<SubagentRunInfo>;
   abortRequested: boolean;
-  /** Host Stop suppresses this run's background/expired-wait completion report. */
-  suppressParentNotification?: boolean;
   /** Set once the turn limit ends the run; later steering is refused instead of starting another turn. */
   turnLimitReached?: boolean;
   cancelQueued?: () => boolean;
@@ -113,36 +106,13 @@ type StoredSubagentExecution = {
 };
 
 /** A run's completion `notifyParent()` is delivering; `since` is absent on one added before a hot reload. */
-type ParentNotification = Pick<SubagentRunInfo, "sessionId" | "parentSessionId" | "completedAt"> & {
-  since?: number;
-  cancelled?: boolean;
-  /** Preserve suppression if this same completion is offered again after Stop. */
-  completionRun?: SubagentRunInfo;
-  notificationId?: string;
-  submitted?: boolean;
-  dispatched?: boolean;
-  isSuppressed?: () => boolean;
-  onDispatched?: () => void;
-  unsubscribe?: () => void;
-};
-
-type SubagentAdmission = {
-  parentSessionId: string;
-  cancelled: boolean;
-  completion: Promise<void>;
-  finish(): void;
-};
+type ParentNotification = Pick<SubagentRunInfo, "sessionId" | "parentSessionId" | "completedAt"> & { since?: number };
 
 declare global {
   var __piSubagentRuns: Map<string, StoredSubagentExecution> | undefined;
   var __piSubagentQueue: SubagentQueue<SubagentRunInfo> | undefined;
   var __piSubagentConsumedResults: Map<string, string> | undefined;
   var __piSubagentParentNotifications: Set<ParentNotification> | undefined;
-  var __piSubagentAdmissions: Set<SubagentAdmission> | undefined;
-  var __piSubagentStoppedResults: WeakSet<SubagentRunInfo> | undefined;
-  var __piSubagentStoppingFamily: Map<string, number> | undefined;
-  var __piSubagentParents: Map<string, string> | undefined;
-  var __piSubagentNotificationTokens: Map<string, ParentNotification> | undefined;
 }
 const RESUME_ADMISSION_LOCK = Symbol.for("pi-web.subagent-resume-admission");
 const SUBAGENT_CONTEXT_LIMIT = 50_000;
@@ -243,61 +213,15 @@ function unsettledSubagentRuns(): ParentNotification[] {
  * turn a report starts decides that (#1434).
  */
 export function hasUnsettledSubagentRun(sessionId: string): boolean {
-  const runs = unsettledSubagentRuns();
-  const family = subagentFamily(sessionId, runs);
-  return runs.some((run) => run.sessionId !== sessionId && family.has(run.sessionId));
-}
-
-/** Register persisted ancestry on RPC reopen as well as dispatch; never mutate a run snapshot. */
-export function registerSubagentParent(sessionId: string, parentSessionId: string): void {
-  if (sessionId === parentSessionId) return;
-  (globalThis.__piSubagentParents ??= new Map()).set(sessionId, parentSessionId);
-}
-
-/**
- * Completed intermediates still connect their active descendants to the owner. Keep only
- * ancestors of active runs, pending reports, setup admissions or a Stop currently unwinding.
- * Pruning never drops an edge needed by one of those roots, even if that session has settled.
- */
-function retainedSubagentParents(): Map<string, string> {
-  const parents = globalThis.__piSubagentParents;
-  const active = [
-    // Read only: a status/debug read must not create these tables.
-    ...[...(globalThis.__piSubagentRuns?.values() ?? [])].map((stored) => stored.run),
-    // Read, never create: a debug snapshot or a status read must not leave tables behind.
-    ...(globalThis.__piSubagentParentNotifications ?? []),
-    ...(globalThis.__piSubagentNotificationTokens?.values() ?? []),
-  ];
-  if (!parents) return new Map();
-  for (const run of active) registerSubagentParent(run.sessionId, run.parentSessionId);
-  const keep = new Set<string>();
-  const seeds = [
-    ...active.map((run) => run.sessionId),
-    ...[...(globalThis.__piSubagentAdmissions ?? [])].map((admission) => admission.parentSessionId),
-    ...(globalThis.__piSubagentStoppingFamily?.keys() ?? []),
-  ];
-  for (let id of seeds) {
-    while (!keep.has(id)) {
-      keep.add(id);
-      const parent = parents.get(id);
-      if (!parent) break;
-      id = parent;
-    }
-  }
-  for (const id of parents.keys()) if (!keep.has(id)) parents.delete(id);
-  return parents;
+  return subagentFamily(sessionId, unsettledSubagentRuns()).size > 1;
 }
 
 /** `sessionId` and every session under it, at any depth, by the rows' direct parents. */
 function subagentFamily(sessionId: string, runs: readonly Pick<SubagentRunInfo, "sessionId" | "parentSessionId">[]): Set<string> {
-  const edges = [
-    ...runs,
-    ...[...retainedSubagentParents()].map(([sessionId, parentSessionId]) => ({ sessionId, parentSessionId })),
-  ];
   const family = new Set([sessionId]);
   for (let grew = true; grew;) {
     grew = false;
-    for (const run of edges) {
+    for (const run of runs) {
       if (!family.has(run.parentSessionId) || family.has(run.sessionId)) continue;
       family.add(run.sessionId);
       grew = true;
@@ -341,16 +265,7 @@ export function subagentDebugSnapshot(sessionId?: string): { runs: DebugSubagent
 
 /** Every session `hasUnsettledSubagentRun()` holds for: the parents of the unsettled runs. */
 export function getSessionIdsWithUnsettledSubagentRuns(): string[] {
-  const parents = retainedSubagentParents();
-  const ids = new Set<string>();
-  for (const run of unsettledSubagentRuns()) {
-    let id: string | undefined = run.parentSessionId;
-    while (id && !ids.has(id)) {
-      ids.add(id);
-      id = parents.get(id);
-    }
-  }
-  return [...ids];
+  return [...new Set(unsettledSubagentRuns().map((run) => run.parentSessionId))];
 }
 
 function getSubagentQueue(): SubagentQueue<SubagentRunInfo> {
@@ -513,152 +428,15 @@ function recordResult(sessionManager: SessionManager, run: SubagentRunInfo): Sub
   return recorded;
 }
 
-function beginSubagentAdmission(parentSessionId: string): SubagentAdmission {
-  let finish!: () => void;
-  const completion = new Promise<void>((resolve) => { finish = resolve; });
-  const admission = { parentSessionId, cancelled: globalThis.__piSubagentStoppingFamily?.has(parentSessionId) === true, completion, finish };
-  (globalThis.__piSubagentAdmissions ??= new Set()).add(admission);
-  return admission;
-}
-
-function endSubagentAdmission(admission: SubagentAdmission): void {
-  globalThis.__piSubagentAdmissions?.delete(admission);
-  admission.finish();
-}
-
-function assertParentAdmission(parent: HostSession | undefined, admission: SubagentAdmission): asserts parent is HostSession {
-  if (admission.cancelled || parent?.isStopping?.() || globalThis.__piSubagentStoppingFamily?.has(admission.parentSessionId)) {
-    throw new Error("Parent session is stopping");
-  }
-  if (!parent?.isAlive()) throw new Error("Parent session is no longer available");
-}
-
-function stoppedSubagentResults(): WeakSet<SubagentRunInfo> {
-  return globalThis.__piSubagentStoppedResults ??= new WeakSet();
-}
-
-/**
- * Install LAST in root/Chat-only and child inline factories. A custom message may be deferred
- * by the SDK while agent_settled handlers run; sendCustomMessage() returning is not dispatch.
- * ctx.abort(), unlike throwing from an extension hook, re-arms SDK cancellation at the real
- * run boundary, after the SDK reset its previous idle abort and before any provider request.
- */
-export function createSubagentNotificationCancellationExtension(): ExtensionFactory {
-  return (pi) => {
-    pi.on("before_agent_start", (event, ctx) => {
-      if (event.messageType !== "custom" || event.message.customType !== "pi-web:subagent-notification") return;
-      const details = event.message.details as { notificationId?: unknown } | undefined;
-      if (typeof details?.notificationId !== "string") return;
-      const pending = globalThis.__piSubagentNotificationTokens?.get(details.notificationId);
-      if (!pending) return;
-      if (pending.cancelled || pending.isSuppressed?.()) ctx.abort();
-      pending.onDispatched?.();
-    });
-  };
-}
-
-function childPromptOptions(inner: AgentSessionLike, stored: StoredSubagentExecution) {
-  return {
-    source: "rpc" as const,
-    preflightResult: () => {
-      // Input/auth preparation can outlive an idle abort. _startRun is now active: re-arm
-      // cancellation permanently for this run before its awaited agent_start/provider call.
-      if (stored.abortRequested) void inner.abort().catch(() => undefined);
-    },
-  };
-}
-
-/** Request cancellation only; the caller decides whether to await SDK abort/completion. */
-function requestSubagentAbort(stored: StoredSubagentExecution, wrapper: HostSession | undefined): Promise<void> | undefined {
-  stored.abortRequested = true;
-  if (stored.run.status === "queued") stored.cancelQueued?.();
-  else if (stored.mcpWait) stored.mcpWait.abort();
-  else return wrapper?.inner.abort();
-}
-
-/**
- * Host Stop, not cancellation of a foreground tool's bounded wait. The host must raise its
- * isStopping barrier synchronously, and abort its own SDK run concurrently with this call.
- * Broadcast before awaiting: a child can itself be waiting on a descendant. Never await a
- * notifyParent delivery, which may be waiting for this very parent to idle. In-flight setup
- * admissions stay cancelled even if the host barrier falls before their setup resumes.
- */
-export async function abortSubagentFamily(
-  parentSessionId: string,
-  dependencies: Pick<SubagentRuntimeDependencies, "getSession">,
-): Promise<void> {
-  const family = subagentFamily(parentSessionId, [
-    ...[...getSubagentRuns().values()].map((stored) => stored.run), ...getParentNotifications(),
-  ]);
-  const stopping = globalThis.__piSubagentStoppingFamily ??= new Map();
-  for (const id of family) stopping.set(id, (stopping.get(id) ?? 0) + 1);
-  const admissions = [...(globalThis.__piSubagentAdmissions ?? [])]
-    .filter((admission) => family.has(admission.parentSessionId));
-  for (const admission of admissions) admission.cancelled = true;
-  const runs = [...getSubagentRuns().values()].filter((stored) => family.has(stored.run.sessionId));
-  // Mark everything before cancellation can synchronously settle a queue/invoke callbacks.
-  for (const stored of runs) {
-    stored.suppressParentNotification = true;
-    stored.abortRequested = true;
-  }
-  for (const pending of getParentNotifications()) {
-    if (!family.has(pending.sessionId) && !family.has(pending.parentSessionId)) continue;
-    pending.cancelled = true;
-    if (pending.completionRun) stoppedSubagentResults().add(pending.completionRun);
-    getParentNotifications().delete(pending);
-  }
-  const waits: Promise<unknown>[] = admissions.map((admission) => admission.completion);
-  for (const stored of runs) {
-    // The host owns its own abort/unwind. Waiting for its controller completion here can
-    // deadlock when this helper is called from that very run's tool stack.
-    if (stored.run.sessionId === parentSessionId) continue;
-    waits.push(stored.completion);
-    try {
-      const abort = requestSubagentAbort(stored, dependencies.getSession(stored.run.sessionId));
-      if (abort) waits.push(abort);
-    } catch {
-      // Continue broadcasting; completion is the authority for actual unwind.
-    }
-  }
-  try { await Promise.allSettled(waits); }
-  finally {
-    for (const id of family) {
-      const count = stopping.get(id)! - 1;
-      if (count) stopping.set(id, count);
-      else stopping.delete(id);
-    }
-  }
-}
-
 export function createSubagentController(
   dependencies: SubagentRuntimeDependencies,
 ): SubagentController {
-  function rememberOwnerAncestry(sessionId: string): void {
-    const seen = new Set<string>();
-    while (!seen.has(sessionId)) {
-      seen.add(sessionId);
-      const wrapper = dependencies.getSession(sessionId);
-      const entries = wrapper?.inner.sessionManager.getEntries?.() as unknown as SessionEntry[] | undefined;
-      const run = entries && readSubagentRun(entries, sessionId, wrapper!.sessionFile);
-      if (!run) break;
-      registerSubagentParent(sessionId, run.parentSessionId);
-      sessionId = run.parentSessionId;
-    }
-  }
-
   async function start(request: StartSubagentRequest): Promise<SubagentExecution> {
-    const admission = beginSubagentAdmission(request.parentContext.sessionManager.getSessionId());
-    try { return await admitStart(request, admission); }
-    finally { endSubagentAdmission(admission); }
-  }
-
-  async function admitStart(request: StartSubagentRequest, admission: SubagentAdmission): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
-    rememberOwnerAncestry(parentSessionId);
     const parent = dependencies.getSession(parentSessionId);
-    assertParentAdmission(parent, admission);
+    if (!parent?.isAlive()) throw new Error("Parent session is no longer available");
     if (!parent.sessionFile) throw new Error("Parent session must be persisted before starting a subagent");
 
     let isolatedWorktree: { path: string; branch: string } | undefined;
@@ -751,7 +529,6 @@ export function createSubagentController(
         ...(mcp ? [...mcp.extensions, createSubagentMcpPolicyExtension(() => mcpScope)] : []),
         ...(skillsBinding.loaderOptions.extensionFactories ?? []),
         ...(localPolicy ? [createLocalSubagentPolicyExtension(localPolicy)] : []),
-        createSubagentNotificationCancellationExtension(),
       ];
       if (!chatOnly) initTheme();
       const services = await createLocalSubagentServices({
@@ -853,7 +630,6 @@ export function createSubagentController(
         throw new Error(`Invalid subagent thinking level: ${thinking}`);
       }
       const parentModel = parent.inner.model as ReturnType<ModelRuntime["getModel"]>;
-      assertParentAdmission(dependencies.getSession(parentSessionId), admission);
       const { session: inner } = await createAgentSessionFromServices({
         services,
         sessionManager,
@@ -861,8 +637,6 @@ export function createSubagentController(
         ...(thinking ? { thinkingLevel: thinking as ThinkingLevel } : {}),
         ...subagentToolOptions({ tools: activeTools, allExtensionTools, mcp: mcpEnabled }),
       });
-      try { assertParentAdmission(dependencies.getSession(parentSessionId), admission); }
-      catch (error) { inner.dispose(); throw error; }
       persistChildSession(sessionManager);
       skillsBinding.setActiveToolsGetter(() => inner.getActiveToolNames());
       const childSession = dependencies.registerSession(inner, {
@@ -888,22 +662,13 @@ export function createSubagentController(
       };
 
       let resolveCompletion!: (run: SubagentRunInfo) => void;
-      const completion = new Promise<SubagentRunInfo>((resolve) => {
-        let settled = false;
-        resolveCompletion = (run) => {
-          if (settled) return;
-          settled = true;
-          if (stored.suppressParentNotification) stoppedSubagentResults().add(run);
-          resolve(run);
-        };
-      });
+      const completion = new Promise<SubagentRunInfo>((resolve) => { resolveCompletion = resolve; });
       const stored: StoredSubagentExecution = {
         run: initialRun,
         completion,
         abortRequested: false,
         dispatchedAt: Date.now(),
       };
-      registerSubagentParent(initialRun.sessionId, parentSessionId);
       getSubagentRuns().set(initialRun.sessionId, stored);
       request.onUpdate?.(initialRun);
       dependencies.invalidateSessionList();
@@ -983,8 +748,7 @@ export function createSubagentController(
         let result: SubagentRunInfo;
         try {
           await prepareChildMcp(childSession, stored);
-          if (stored.abortRequested) throw new Error("Subagent is stopping");
-          await inner.prompt(delegatedTask, childPromptOptions(inner, stored));
+          await inner.prompt(delegatedTask, { source: "rpc" });
           const text = inner.getLastAssistantText()?.trim();
           const stop = stored.abortRequested ? undefined : lastAssistantStop(sessionManager);
           const aborted = stored.abortRequested || stop?.aborted === true;
@@ -1090,27 +854,22 @@ export function createSubagentController(
   async function resume(request: ResumeSubagentRequest): Promise<SubagentExecution> {
     // Serialize admission only: once queued, the run map prevents another resume while the
     // child works. Never hold this lock for the child's completion (or its parent's queue).
-    const admission = beginSubagentAdmission(request.parentContext.sessionManager.getSessionId());
-    try { return await serializeByKey(RESUME_ADMISSION_LOCK, request.sessionId, () => admitResume(request, admission)); }
-    finally { endSubagentAdmission(admission); }
+    return serializeByKey(RESUME_ADMISSION_LOCK, request.sessionId, () => admitResume(request));
   }
 
-  async function admitResume(request: ResumeSubagentRequest, admission: SubagentAdmission): Promise<SubagentExecution> {
+  async function admitResume(request: ResumeSubagentRequest): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
-    rememberOwnerAncestry(parentSessionId);
-    assertParentAdmission(dependencies.getSession(parentSessionId), admission);
     const existing = await get(request.sessionId);
     if (!existing) throw new Error(`Subagent not found: ${request.sessionId}`);
     if (existing.parentSessionId !== parentSessionId) throw new Error("Subagent does not belong to this parent session");
     if (existing.status === "running" || existing.status === "queued") throw new Error("Subagent is already running");
     const parent = dependencies.getSession(parentSessionId);
-    assertParentAdmission(parent, admission);
+    if (!parent?.isAlive()) throw new Error("Parent session is no longer available");
     const sessionPath = existing.sessionPath || await dependencies.resolveSessionPath(request.sessionId);
     if (!sessionPath) throw new Error(`Subagent session file not found: ${request.sessionId}`);
     // Disk-only inspection precedes reopen, which can import resources and connect services.
-    assertParentAdmission(dependencies.getSession(parentSessionId), admission);
     assertContinuation(parent, sessionPath, request.sessionId, parentSessionId);
     let wrapper = dependencies.getSession(request.sessionId);
     if (!wrapper?.isAlive()) wrapper = await dependencies.reopenSession(request.sessionId, sessionPath);
@@ -1121,9 +880,9 @@ export function createSubagentController(
     const current = await get(request.sessionId);
     if (!current || current.parentSessionId !== parentSessionId) throw new Error("Subagent does not belong to this parent session");
     const currentParent = dependencies.getSession(parentSessionId);
-    assertParentAdmission(currentParent, admission);
+    if (!currentParent?.isAlive()) throw new Error("Parent session is no longer available");
     assertContinuation(currentParent, sessionPath, request.sessionId, parentSessionId);
-    if (!wrapper.isAlive() || wrapper.isStopping?.()) throw new Error("Subagent session is no longer available or is stopping");
+    if (!wrapper.isAlive()) throw new Error("Subagent session is no longer available");
     if (current.status === "running" || current.status === "queued" || wrapper.isRunning()) throw new Error("Subagent is already running");
     // The run prompts the SDK session directly, past the wrapper's `send()`, so refuse here as
     // `send()` does: an isolated child's worktree is removed when its run ends, and a run in the
@@ -1149,17 +908,8 @@ export function createSubagentController(
     };
     const manager = wrapper.inner.sessionManager;
     let resolveCompletion!: (run: SubagentRunInfo) => void;
-    const completion = new Promise<SubagentRunInfo>((resolve) => {
-      let settled = false;
-      resolveCompletion = (run) => {
-        if (settled) return;
-        settled = true;
-        if (stored.suppressParentNotification) stoppedSubagentResults().add(run);
-        resolve(run);
-      };
-    });
+    const completion = new Promise<SubagentRunInfo>((resolve) => { resolveCompletion = resolve; });
     const stored: StoredSubagentExecution = { run: initialRun, completion, abortRequested: false, dispatchedAt: Date.now() };
-    registerSubagentParent(request.sessionId, parentSessionId);
     getSubagentRuns().set(request.sessionId, stored);
     request.onUpdate?.(initialRun);
     dependencies.invalidateSessionList();
@@ -1188,8 +938,7 @@ export function createSubagentController(
       let result: SubagentRunInfo;
       try {
         await prepareChildMcp(wrapper, stored);
-        if (stored.abortRequested) throw new Error("Subagent is stopping");
-        await wrapper!.inner.prompt(request.task, childPromptOptions(wrapper!.inner, stored));
+        await wrapper!.inner.prompt(request.task, { source: "rpc" });
         const text = wrapper!.inner.getLastAssistantText()?.trim();
         const stop = stored.abortRequested ? undefined : lastAssistantStop(manager);
         const aborted = stored.abortRequested || stop?.aborted === true;
@@ -1301,14 +1050,10 @@ export function createSubagentController(
     const parentSessionId = parentContext?.sessionManager.getSessionId() ?? run?.parentSessionId;
     const parent = parentSessionId ? dependencies.getSession(parentSessionId) : undefined;
     if (!parent?.isAlive() || !parentSessionId) throw new Error("Parent session is no longer available");
-    if (parent.isStopping?.() || globalThis.__piSubagentStoppingFamily?.has(parentSessionId)) throw new Error("Parent session is stopping");
     if (!run || run.parentSessionId !== parentSessionId) throw new Error("Subagent does not belong to this parent session");
     const path = wrapper?.sessionFile || run.sessionPath || await dependencies.resolveSessionPath(sessionId);
     if (!path) throw new Error("Subagent session file not found");
-    const currentParent = dependencies.getSession(parentSessionId);
-    if (!currentParent?.isAlive() || currentParent.isStopping?.() || globalThis.__piSubagentStoppingFamily?.has(parentSessionId)) throw new Error("Parent session is stopping or no longer available");
-    assertContinuation(currentParent, path, sessionId, parentSessionId);
-    if (wrapper?.isStopping?.()) throw new Error("Subagent is stopping");
+    assertContinuation(parent, path, sessionId, parentSessionId);
     if (!wrapper?.isAlive() || !wrapper.isRunning()) throw new Error("Subagent is not running");
     if (getSubagentRuns().get(sessionId)?.turnLimitReached) throw new Error("Subagent reached its turn limit and is stopping; resume it to continue");
     if (!message.trim()) throw new Error("Steering message is required");
@@ -1316,83 +1061,45 @@ export function createSubagentController(
   }
 
   async function notifyParent(run: SubagentRunInfo): Promise<void> {
-    if (stoppedSubagentResults().has(run)) return;
-    const notificationId = randomUUID();
-    const pending: ParentNotification = {
-      sessionId: run.sessionId, parentSessionId: run.parentSessionId, completedAt: run.completedAt,
-      since: Date.now(), completionRun: run, notificationId,
-    };
+    const pending = { sessionId: run.sessionId, parentSessionId: run.parentSessionId, completedAt: run.completedAt, since: Date.now() };
     const notifications = getParentNotifications();
-    const tokens = globalThis.__piSubagentNotificationTokens ??= new Map();
-    pending.onDispatched = () => {
-      pending.dispatched = true;
-      notifications.delete(pending);
-      tokens.delete(notificationId);
-      pending.unsubscribe?.();
-      pending.unsubscribe = undefined;
-    };
     notifications.add(pending);
-    tokens.set(notificationId, pending);
     try {
-      await deliverParentNotification(run, pending);
-    } catch (error) {
-      pending.onDispatched();
-      throw error;
+      await deliverParentNotification(run, () => notifications.delete(pending));
     } finally {
-      // sendCustomMessage may return while agent_settled still holds its deferred action.
-      // Keep that action's permanent token/guard until the real before_agent_start boundary.
-      if (!pending.submitted || pending.dispatched) pending.onDispatched();
+      notifications.delete(pending);
     }
   }
 
-  async function deliverParentNotification(run: SubagentRunInfo, pending: ParentNotification): Promise<void> {
-    const suppressed = () => pending.cancelled === true || stoppedSubagentResults().has(run)
-      || globalThis.__piSubagentStoppingFamily?.has(run.parentSessionId) === true
-      || dependencies.getSession(run.parentSessionId)?.isStopping?.() === true;
-    pending.isSuppressed = () => suppressed() || takeResultConsumed(run);
-    if (suppressed() || takeResultConsumed(run)) return;
+  async function deliverParentNotification(run: SubagentRunInfo, onTurnStarted: () => void): Promise<void> {
+    if (takeResultConsumed(run)) return;
     let parent = dependencies.getSession(run.parentSessionId);
     if (!parent?.isAlive()) {
       const sessionFile = await dependencies.resolveSessionPath(run.parentSessionId);
-      if (suppressed()) return;
       if (!sessionFile) throw new Error(`Parent session not found: ${run.parentSessionId}`);
       parent = await dependencies.reopenSession(run.parentSessionId, sessionFile);
     }
-    if (suppressed()) return;
     await parent.waitUntilReady();
-    if (suppressed()) return;
     // The parent may still be inside the `get_subagent_result` call that collects this result,
     // and `deliverAs: "followUp"` would only queue the message until that turn ends anyway.
     // Hold the notification until the parent is idle and re-check the mark, so a result the
     // parent already consumed never triggers a duplicate turn.
     while (parent.isAlive() && parent.isRunning()) {
-      if (suppressed() || takeResultConsumed(run)) return;
+      if (takeResultConsumed(run)) return;
       await new Promise<void>((resolve) => { setTimeout(resolve, PARENT_IDLE_POLL_MS); });
     }
-    if (suppressed() || takeResultConsumed(run)) return;
+    if (takeResultConsumed(run)) return;
     if (!parent.isAlive()) throw new Error(`Parent session is no longer available: ${run.parentSessionId}`);
-    // Public-event fallback for wrappers created before the cancellation factory was added
-    // (hot reload). The installed factory is earlier and matches the precise custom token.
-    if (typeof parent.inner.subscribe === "function") {
-      const inner = parent.inner;
-      pending.unsubscribe = inner.subscribe((event) => {
-        if (event.type !== "agent_start") return;
-        if (pending.isSuppressed?.()) void inner.abort().catch(() => undefined);
-        pending.onDispatched?.();
-      });
-    }
-    pending.submitted = true;
-    const sending = parent.inner.sendCustomMessage({
+    const delivery = parent.inner.sendCustomMessage({
       customType: "pi-web:subagent-notification",
       content: subagentNotificationText(run),
       display: true,
-      details: { ...subagentToolDetails(run), notificationId: pending.notificationId },
+      details: subagentToolDetails(run),
     }, { deliverAs: "followUp", triggerTurn: true });
-    // Historical structural test hosts have no event API: their sendCustomMessage
-    // returning means the turn started. The installed SDK's deferred action is
-    // covered by the before_agent_start token gate instead.
-    if (typeof parent.inner.subscribe !== "function") pending.onDispatched?.();
-    await sending;
+    // pi starts the turn before its first await, and resolves only once that turn settled. From
+    // here the parent's own run stands for this result: its end must not see the result as pending.
+    if (parent.isRunning()) onTurnStarted();
+    await delivery;
   }
 
   async function abort(sessionId: string): Promise<void> {
@@ -1419,6 +1126,5 @@ export function createSubagentController(
     get,
     steer,
     abort,
-    abortFamily: (sessionId) => abortSubagentFamily(sessionId, dependencies),
   };
 }

@@ -3,7 +3,7 @@ import { MCP_EXTENSION_PATH } from "./mcp-command";
 import { readSessionToolSelection } from "./session-tool-selection";
 import { SDK_BUILTIN_TOOLS } from "./subagents";
 import type { SessionEntry } from "./types";
-import { localModeGuideline, localToolCallBlockReason, localToolPolicy } from "./local-tool-modes";
+import { localParentModeGuidance, localToolCallBlockReason, localToolPolicy } from "./local-tool-modes";
 
 // Normal sessions enforce the local plan/build/full policy below. Subagent
 // wrappers retain their profile-scoped MCP policy (ADR 0006). Host subagent
@@ -77,21 +77,11 @@ export function createSubagentMcpPolicyExtension(
 
 export function createReadOnlyMcpPolicyExtension(
   defaultTools: () => readonly string[] | undefined = () => undefined,
-  isStopping?: (sessionId: string) => boolean,
 ): InlineExtension {
   return {
     name: READ_ONLY_MCP_POLICY_EXTENSION_NAME,
     hidden: true,
     factory: (pi) => {
-      // A previous input handler can outlive Stop, before an SDK run is active.
-      // Consume that input through the supported gate, not a throwing
-      // before_agent_start hook (whose errors the SDK catches and continues).
-      // Register after other input handlers; direct custom triggers bypass input.
-      // The wrapper reports the stopped submission via its stop-epoch check.
-      pi.on("input", (_event, ctx) => {
-        if (isStopping?.(ctx.sessionManager.getSessionId()) === true) return { action: "handled" };
-        return undefined;
-      });
       pi.on("before_agent_start", (event, ctx) => {
         const policy = localToolPolicy(
           readSessionToolSelection(ctx.sessionManager.getEntries() as unknown as SessionEntry[]),
@@ -101,7 +91,7 @@ export function createReadOnlyMcpPolicyExtension(
         // An earlier handler may have edited selectedTools explicitly; pi gives
         // that edit precedence over setActiveTools. Reassert both upstream paths.
         event.systemPromptOptions.selectedTools = pi.getActiveTools();
-        const guideline = localModeGuideline(policy.mode);
+        const guideline = localParentModeGuidance(policy.mode);
         if (guideline) {
           // A replacement SYSTEM.md omits the SDK's rules section. Its custom
           // sections still render, so keep the parent policy visible there too.

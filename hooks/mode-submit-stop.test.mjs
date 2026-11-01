@@ -15,14 +15,13 @@ globalThis.document ??= Object.assign(new EventTarget(), { visibilityState: "vis
 globalThis.window ??= new EventTarget();
 const image = { data: "AQID", mimeType: "image/png", previewUrl: "blob:image" };
 
-async function setup({ fresh = false, subagent = false, familyActive = false } = {}) {
+async function setup({ fresh = false, subagent = false } = {}) {
   mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
   const sources = [], commands = [], restores = [], creations = [];
   const server = {
-    state: { isStreaming: false, isPromptRunning: false, isStopping: false, subagentsActive: familyActive },
-    wrapperPresent: true, noWrapperSubagentsActive: undefined, leaseGate: null,
-    historyGate: null, toolsGate: null, creationGate: null, promptGate: null, abortGate: null,
-    promptRejected: false, abortLost: false, statusDown: false, ack: null, bashGate: null,
+    state: { isStreaming: false, isPromptRunning: false },
+    historyGate: null, toolsGate: null, creationGate: null, promptGate: null,
+    promptRejected: false, ack: null,
   };
   globalThis.EventSource = class {
     readyState = 0;
@@ -39,9 +38,7 @@ async function setup({ fresh = false, subagent = false, familyActive = false } =
     }
     if (url === "/api/sessions/mode-test/state") return Response.json({ running: true, state: server.state });
     if (url === "/api/agent/mode-test/lease") {
-      const reply = { running: false, subagentsActive: server.state.subagentsActive };
-      await server.leaseGate?.promise;
-      return Response.json(reply);
+      return Response.json({ running: false });
     }
     if (url.startsWith("/api/agent/mode-test") && init.body) {
       const cmd = JSON.parse(init.body); commands.push(cmd);
@@ -54,19 +51,10 @@ async function setup({ fresh = false, subagent = false, familyActive = false } =
         if (server.promptRejected) return Response.json({ error: "busy", code: "prompt_rejected", accepted: false }, { status: 409 });
         return Response.json({ success: true, data: server.ack });
       }
-      if (cmd.type === "bash") await server.bashGate?.promise;
-      if (cmd.type === "abort" || cmd.type === "abort_bash") {
-        await server.abortGate?.promise;
-        if (server.abortLost) throw new TypeError("lost abort response");
-        return Response.json({ success: true, data: { steering: ["recalled"], followUp: [] } });
-      }
       return Response.json({ success: true, data: null });
     }
     if (url.startsWith("/api/agent/mode-test")) {
-      if (server.statusDown) throw new TypeError("offline");
-      return Response.json(server.wrapperPresent
-        ? { running: true, state: server.state }
-        : { running: false, ...(server.noWrapperSubagentsActive !== undefined ? { subagentsActive: server.noWrapperSubagentsActive } : {}) });
+      return Response.json({ running: true, state: server.state });
     }
     return Response.json({});
   };
@@ -88,8 +76,6 @@ async function setup({ fresh = false, subagent = false, familyActive = false } =
   await connect();
   return { hook, server, commands, restores, creations, connect,
     prompts: () => commands.filter(c => c.type === "prompt"),
-    emit: async event => { sources.filter(s => s.readyState === 1).at(-1)?.emit(event); await settle(); hook.flush(); },
-    tick: async () => { mock.timers.tick(1000); await settle(); hook.flush(); },
     close() { hook.unmount(); mock.timers.reset(); clearDraft("mode-test"); deleteSessionViewSnapshot("mode-test"); },
   };
 }
@@ -108,7 +94,7 @@ test("rapid local picks do not RPC; send freezes its tools before fresh creation
     assert.equal(e.commands.length, 0);
     e.server.creationGate = Promise.withResolvers();
     const send = e.hook.result.handleSend("plan this", [image]);
-    e.hook.result.handleToolPresetChange("full"); // an active submission cannot change its draft
+    e.hook.result.handleToolPresetChange("full"); // a running submission cannot change its draft
     e.server.creationGate.resolve(); await settle(); await e.connect(); await send; e.hook.flush();
     assert.deepEqual(e.prompts()[0].toolNames, PRESET_READ_ONLY);
     assert.equal(e.hook.result.toolPreset, "read-only");
@@ -146,161 +132,18 @@ test("late tools/history reads never revert an explicitly selected next mode", a
   });
 });
 
-test("Stop exposes a local next draft, but early terminal events cannot unlock any send path", async () => {
-  await withSetup({}, async e => {
-    await e.emit({ type: "agent_start" });
-    e.hook.result.handleToolPresetChange("full"); e.hook.flush();
-    assert.equal(e.hook.result.toolPreset, "default", "running mode is locked");
-    e.server.abortGate = Promise.withResolvers();
-    const stopping = e.hook.result.handleAbort(); e.hook.flush();
-    assert.equal(e.hook.result.isStopping, true);
-    e.hook.result.handleToolPresetChange("read-only"); e.hook.flush();
-    assert.equal(e.hook.result.toolPreset, "read-only");
-    await e.emit({ type: "agent_end" });
-    await e.emit({ type: "agent_settled", aborted: true });
-    await e.tick();
-    assert.equal(e.hook.result.isStopping, true, "idle snapshots while abort RPC is pending cannot unlock");
-    await e.hook.result.handleSend("blocked ordinary", [image]);
-    await e.hook.result.handleSteer("blocked steer", [image]);
-    await e.hook.result.handleFollowUp("blocked followup");
-    await e.hook.result.handlePromptWithStreamingBehavior("blocked slash", "steer");
-    assert.equal(e.prompts().length, 0);
-    e.server.abortGate.resolve(); await stopping; e.hook.flush();
-    assert.equal(e.hook.result.isStopping, false);
-    assert.deepEqual(e.restores, ["recalled"]);
-    await e.hook.result.handleSend("next plan");
-    assert.deepEqual(e.prompts().at(-1).toolNames, PRESET_READ_ONLY);
-  });
-});
-
-test("Bash Stop uses authoritative abort, keeps the ordinary draft and delays every submission until completion", async () => {
-  await withSetup({}, async e => {
-    e.server.bashGate = Promise.withResolvers();
-    const bash = e.hook.result.handleSend("!fake shell command"); await settle(); e.hook.flush();
-    assert.equal(e.hook.result.bashRunning, true);
-    setDraft("mode-test", { value: "next text", images: [image] });
-    e.server.abortGate = Promise.withResolvers();
-    const stopping = e.hook.result.handleAbort(); e.hook.flush();
-    assert.equal(e.hook.result.isStopping, true);
-    e.hook.result.handleToolPresetChange("read-only");
-    assert.equal(e.commands.filter(c => c.type === "abort").length, 1);
-    assert.equal(e.commands.filter(c => c.type === "abort_bash").length, 0);
-    assert.equal(getDraft("mode-test").value, "next text");
-    assert.equal(getDraft("mode-test").images[0].data, image.data);
-    e.server.abortGate.resolve(); await stopping;
-    e.server.bashGate.resolve(); await bash; e.hook.flush();
-    assert.equal(e.hook.result.isStopping, false);
-    assert.equal(e.hook.result.bashRunning, false);
-    assert.equal(e.hook.result.toolPreset, "read-only");
-    assert.equal(e.prompts().length, 0);
-  });
-});
-
-test("lost abort response stays blocked when unknown or descendants remain; read-only idle confirmation unlocks", async () => {
-  await withSetup({}, async e => {
-    await e.emit({ type: "agent_start" });
-    e.server.abortLost = true; await e.hook.result.handleAbort(); e.hook.flush();
-    e.server.statusDown = true; await e.tick();
-    assert.equal(e.hook.result.isStopping, true);
-    e.server.statusDown = false; e.server.state.subagentsActive = true; await e.tick();
-    assert.equal(e.hook.result.isStopping, true);
-    e.server.state.subagentsActive = false; await e.tick();
-    assert.equal(e.hook.result.isStopping, false, "running:true means a live wrapper, not an active turn");
-    assert.equal(e.commands.filter(c => c.type === "abort").length, 1);
-    assert.equal(e.prompts().length, 0);
-  });
-});
-
-test("no-wrapper stop recovery requires explicit top-level child inactivity, never true or unknown", async () => {
-  await withSetup({}, async e => {
-    e.server.abortLost = true; await e.hook.result.handleAbort(); e.hook.flush();
-    e.server.wrapperPresent = false;
-    for (const active of [true, undefined]) {
-      e.server.noWrapperSubagentsActive = active; await e.tick();
-      assert.equal(e.hook.result.isStopping, true);
-    }
-    e.server.noWrapperSubagentsActive = false; await e.tick();
-    assert.equal(e.hook.result.isStopping, false);
-    assert.equal(e.commands.filter(c => c.type === "abort").length, 1);
-  });
-});
-
-test("idle parents retain separate child activity, lock modes and allow tool-free steering until whole-task Stop", async () => {
-  await withSetup({}, async e => {
-    await e.emit({ type: "agent_start" });
-    e.server.state.subagentsActive = true;
-    await e.emit({ type: "agent_settled", subagentsActive: true });
-    await e.emit({ type: "prompt_done", subagentsActive: true });
-    assert.equal(e.hook.result.agentRunning, false, "child activity is not parent model time");
-    assert.equal(e.hook.result.subagentsActive, true);
-    e.hook.result.handleToolPresetChange("full"); e.hook.flush();
-    assert.equal(e.hook.result.toolPreset, "default");
-    await e.hook.result.handleSend("blocked ordinary mode override");
-    assert.equal(e.prompts().length, 0);
-    await e.hook.result.handleSteer("steer parent while children run");
-    assert.equal(e.prompts()[0].streamingBehavior, "steer");
-    assert.equal(Object.hasOwn(e.prompts()[0], "toolNames"), false);
-    await e.hook.result.handleAbort(); e.hook.flush();
-    assert.equal(e.commands.filter(c => c.type === "abort").length, 1);
-    assert.equal(e.hook.result.subagentsActive, false);
-    assert.equal(e.hook.result.agentRunning, false);
-  });
-});
-
-test("mount/lease snapshots track child-only tasks and a late false lease cannot undo a newer settled event", async () => {
-  await withSetup({ familyActive: true }, async e => {
-    assert.equal(e.hook.result.subagentsActive, true);
-    assert.equal(e.hook.result.agentRunning, false);
-    await e.emit({ type: "agent_settled", subagentsActive: false });
-    assert.equal(e.hook.result.subagentsActive, false, "final authoritative settlement clears the family");
-    e.server.state.subagentsActive = false;
-    e.server.leaseGate = Promise.withResolvers();
-    document.dispatchEvent(new Event("visibilitychange")); await settle();
-    await e.emit({ type: "agent_settled", subagentsActive: true });
-    e.server.leaseGate.resolve(); await settle(); e.hook.flush();
-    assert.equal(e.hook.result.subagentsActive, true, "pre-event idle snapshot is stale");
-    e.server.leaseGate = null; e.server.state.subagentsActive = false;
-    document.dispatchEvent(new Event("visibilitychange")); await settle(); e.hook.flush();
-    assert.equal(e.hook.result.subagentsActive, false, "a fresh authoritative lease clears idle child activity");
-    assert.equal(e.hook.result.agentRunning, false);
-  });
-});
-
-test("definite rejection restores text/images ahead of newer draft, preserving a newer mode chosen during Stop", async () => {
+test("definite rejection restores text/images ahead of newer draft input", async () => {
   await withSetup({}, async e => {
     e.hook.result.handleToolPresetChange("read-only");
     e.server.promptGate = Promise.withResolvers(); e.server.promptRejected = true;
     const sending = e.hook.result.handleSend("rejected plan", [image]); await settle();
-    e.server.abortGate = Promise.withResolvers();
-    const stopping = e.hook.result.handleAbort();
-    e.hook.result.handleToolPresetChange("full");
     setDraft("mode-test", { value: "newer text", images: [] });
     e.server.promptGate.resolve(); await sending; await settle(); e.hook.flush();
     assert.deepEqual(e.prompts()[0].toolNames, PRESET_READ_ONLY);
-    assert.equal(e.hook.result.toolPreset, "full");
+    assert.equal(e.hook.result.toolPreset, "read-only");
     assert.equal(getDraft("mode-test").value, "rejected plan\n\nnewer text");
     assert.equal(getDraft("mode-test").images[0].data, image.data);
     assert.ok(e.hook.result.notices.some(n => n.message === "busy"));
-    e.server.abortGate.resolve(); await stopping;
-  });
-});
-
-test("a successful ACK for an older prompt keeps a newer mode chosen while it was stopping", async () => {
-  await withSetup({}, async e => {
-    e.hook.result.handleToolPresetChange("read-only");
-    e.server.promptGate = Promise.withResolvers();
-    const sending = e.hook.result.handleSend("older plan prompt"); await settle();
-    e.server.abortGate = Promise.withResolvers();
-    const stopping = e.hook.result.handleAbort();
-    e.hook.result.handleToolPresetChange("full");
-    // The accepted plan submission returns while Stop is still unwinding.
-    e.server.promptGate.resolve(); await sending; await settle(); e.hook.flush();
-    assert.equal(e.hook.result.toolPreset, "full");
-    e.server.abortGate.resolve(); await stopping; await settle(); e.hook.flush();
-    assert.equal(e.hook.result.isStopping, false);
-    await e.hook.result.handleSend("next full prompt"); await settle(); e.hook.flush();
-    assert.deepEqual(e.prompts().map(prompt => prompt.toolNames), [PRESET_READ_ONLY, ["bash", "read", "edit", "write", "grep", "find", "ls"]]);
-    assert.equal(e.hook.result.toolPreset, "full");
   });
 });
 
@@ -313,21 +156,6 @@ test("a recreated prompt ACK adopts its session id and reconnects without a sepa
     assert.equal(e.hook.result.sessionIdRef.current, "mode-test-recreated");
     assert.deepEqual(e.prompts()[0].toolNames, PRESET_READ_ONLY);
     assert.equal(e.prompts().length, 1);
-  });
-});
-
-test("Stop during fresh creation cannot dispatch the captured prompt even after abort completes", async () => {
-  await withSetup({ fresh: true }, async e => {
-    e.server.creationGate = Promise.withResolvers();
-    const sending = e.hook.result.handleSend("not dispatched", [image]);
-    const stopping = e.hook.result.handleAbort(); e.hook.flush();
-    assert.equal(e.hook.result.isStopping, true);
-    e.hook.result.handleToolPresetChange("full");
-    e.server.creationGate.resolve(); await settle(); await stopping;
-    await e.connect(); await sending; e.hook.flush();
-    assert.equal(e.prompts().length, 0);
-    assert.equal(e.hook.result.toolPreset, "full");
-    assert.equal(e.hook.result.isStopping, false);
   });
 });
 

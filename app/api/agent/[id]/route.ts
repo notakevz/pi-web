@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
 import { startRpcSession, getRpcSession, setRpcSessionTools, sendRpcSessionPrompt } from "@/lib/rpc-manager";
 import { cwdMissingBody, missingCwdFromBody } from "@/lib/missing-cwd";
-import { hasUnsettledSubagentRun } from "@/lib/subagent-runtime";
 
 // POST /api/agent/[id] - Send a command to an existing session
 export async function POST(
@@ -93,7 +92,7 @@ export async function GET(
   try {
     const session = getRpcSession(id);
     if (!session || !session.isAlive()) {
-      return NextResponse.json({ running: false, subagentsActive: hasUnsettledSubagentRun(id) });
+      return NextResponse.json({ running: false });
     }
 
     const state = await session.send({ type: "get_state" }) as Record<string, unknown>;

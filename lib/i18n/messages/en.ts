@@ -834,7 +834,6 @@ export const enLocale: LocalePlugin = {
     "chat.dismissCompactError": "Dismiss compaction error",
     "chat.stopAgent": "Stop agent",
     "chat.stop": "Stop",
-    "chat.stopping": "Stopping…",
     "chat.disableSound": "Disable completion sound",
     "chat.enableSound": "Enable completion sound",
     "chat.thinkingUseDefault": "Use pi default",
