@@ -5,8 +5,10 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url, { tsconfigPaths: true });
 const {
   collectModelRenames,
+  deleteProviderEntry,
   hasModelCostDraftValue,
   modelCostToDraft,
+  modelSidebarLabel,
   parseCompleteModelCost,
   providerMatchesSearch,
   renameProviderEntry,
@@ -195,10 +197,58 @@ test("a provider added since the last save is renamed without a settings rewrite
   assert.deepEqual([...state.renames], []);
 });
 
+test("deleting a renamed or saved provider forgets its rename tracking", () => {
+  const config = {
+    providers: {
+      stepfun: { models: [{ id: "aaa" }] },
+      other: { models: [{ id: "bbb" }] },
+    },
+  };
+  const state = tracking(config);
+  const renamed = renameProviderEntry(config, state, "stepfun", "house");
+  const afterDelete = deleteProviderEntry(renamed, state, "house");
+
+  assert.deepEqual(Object.keys(afterDelete.providers), ["other"]);
+  assert.deepEqual([...state.renames], []);
+  assert.deepEqual([...state.savedProviders], ["other"]);
+  assert.equal(state.slots.has("house"), false);
+
+  // Another saved provider can now take the deleted id and move on cleanly.
+  const movedOther = renameProviderEntry(afterDelete, state, "other", "house");
+  const movedAgain = renameProviderEntry(movedOther, state, "house", "final");
+  assert.deepEqual(Object.keys(movedAgain.providers), ["final"]);
+  assert.deepEqual([...state.renames], [["other", "final"]]);
+});
+
+test("a new provider taking a renamed or deleted provider's old id stays untracked", () => {
+  const config = { providers: { stepfun: { models: [{ id: "aaa" }] } } };
+  const state = tracking(config);
+  const moved = renameProviderEntry(config, state, "stepfun", "house");
+  const withNew = { providers: { ...moved.providers, "new-provider": {} } };
+  const tookOldId = renameProviderEntry(withNew, state, "new-provider", "stepfun");
+  const renamedAgain = renameProviderEntry(tookOldId, state, "stepfun", "fresh");
+
+  assert.deepEqual([...state.renames], [["stepfun", "house"]]);
+  const afterDeletingNew = deleteProviderEntry(renamedAgain, state, "fresh");
+  assert.deepEqual([...state.renames], [["stepfun", "house"]]);
+
+  const afterDeletingSaved = deleteProviderEntry(afterDeletingNew, state, "house");
+  const readded = { providers: { ...afterDeletingSaved.providers, stepfun: {} } };
+  renameProviderEntry(readded, state, "stepfun", "later");
+  assert.deepEqual([...state.renames], []);
+});
+
 test("Add provider's search matches a provider by id or name", () => {
   const oauth = { id: "fixture-subscription-id", name: "Fixture Subscription" };
   assert.equal(providerMatchesSearch("subscription", oauth.id, oauth.name), true);
   assert.equal(providerMatchesSearch(" FIXTURE-SUBSCRIPTION-ID ", oauth.id, oauth.name), true);
   assert.equal(providerMatchesSearch("missing", oauth.id, oauth.name), false);
   assert.equal(providerMatchesSearch("  ", oauth.id, oauth.name), true);
+});
+
+test("the Models sidebar labels a model by its name and falls back to the id", () => {
+  assert.equal(modelSidebarLabel({ id: "qwen3-coder-480b-a35b-instruct", name: "Qwen Coder" }), "Qwen Coder");
+  assert.equal(modelSidebarLabel({ id: "m1" }), "m1");
+  assert.equal(modelSidebarLabel({ id: "m1", name: "  " }), "m1");
+  assert.equal(modelSidebarLabel({ id: "", name: "" }), "");
 });

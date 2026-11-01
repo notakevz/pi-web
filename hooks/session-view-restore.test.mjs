@@ -35,7 +35,10 @@ test("a warmed snapshot paints immediately, restores plan, and preserves paged h
   const unexpected = [];
   let releaseDetail;
   const detailGate = new Promise((resolve) => { releaseDetail = resolve; });
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init = {}) => {
+    if (url === `/api/agent/${id}/lease` && init.method === "POST") {
+      return Response.json({ success: true, running: false, awaitingInput: false, subagentsActive: false });
+    }
     if (url.startsWith(`/api/sessions/${id}?`)) {
       detailReads++;
       await detailGate;

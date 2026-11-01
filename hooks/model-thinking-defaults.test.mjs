@@ -48,6 +48,9 @@ async function setup({ existing = false, defaults = { [key(gpt)]: "high", [key(q
   const preferences = new Map([["pi-tool-preset", "full"]]);
   window.localStorage = { getItem: (k) => preferences.get(k) ?? null, setItem: (k, v) => preferences.set(k, v) };
   globalThis.fetch = async (url, init = {}) => {
+    if (url === "/api/agent/model-defaults/lease" && init.method === "POST") {
+      return Response.json({ success: true, running: false, awaitingInput: false, subagentsActive: false });
+    }
     const body = init.body ? JSON.parse(init.body) : null;
     if (!body) reads.push(url);
     if (url === "/api/models/default") {

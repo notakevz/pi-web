@@ -28,6 +28,13 @@ export function carryCodingToolSelection(
   return [...new Set([...builtins, ...extras])];
 }
 
+/** Keep prompt order only after resolving the allowed set, never as a policy bypass. */
+export function preserveAllowedToolOrder(allowed: readonly string[], previous: readonly string[]): string[] {
+  const names = new Set(allowed);
+  return previous.length === names.size && new Set(previous).size === names.size
+    && previous.every((name) => names.has(name)) ? [...previous] : [...allowed];
+}
+
 /** The same resolved selection feeds both activation and the execution guard. */
 export function localToolPolicy(
   requested: readonly string[] | undefined,
@@ -44,12 +51,12 @@ export function localToolPolicy(
     : key === "bash,edit,find,grep,ls,read,write" ? "full" : "restricted";
   const visible = tools.filter((tool) => tool.exposure !== "hidden");
   if (mode === "none") return { mode, builtins, active: [] };
-  if (mode === "full") return { mode, builtins, active: visible.map((tool) => tool.name) };
+  if (mode === "full") return { mode, builtins, active: preserveAllowedToolOrder(visible.map((tool) => tool.name), carry) };
   const extras = mode === "plan" || mode === "build"
     ? visible.filter(isLimitedModeExtra).map((tool) => tool.name)
     // Preserve the upstream carry rule for legacy, non-preset selections.
     : carryCodingToolSelection(selection, tools, carry, defaultTools).filter((name) => !CODING_TOOLS.has(name));
-  return { mode, builtins, active: [...new Set([...builtins, ...extras])] };
+  return { mode, builtins, active: preserveAllowedToolOrder([...new Set([...builtins, ...extras])], carry) };
 }
 
 function isLimitedModeExtra(tool: LocalModeTool): boolean {

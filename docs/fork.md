@@ -1,6 +1,6 @@
 # Fork customizations
 
-This fork retains the upstream Pi Web package name and version. Its latest release base is v0.12.2; the source also incorporates subsequent upstream main changes through `7c0778a8bc7342f1ededc6f5fb190dc6f4e43044` (`7c0778a`). These post-release changes do not constitute a new upstream release.
+This fork retains the upstream Pi Web package name and version. Its upstream release base is **v0.13.0**, commit `d128bae47cd3abbdfe7135443ac793f547c14e47` (`d128bae`), with the local customizations below retained.
 
 ## Application changes
 
@@ -10,6 +10,7 @@ This fork retains the upstream Pi Web package name and version. Its latest relea
 - Plan and build constrain model tool calls to their builtin allowlists plus vetted subagent/webfetch implementations. Plan permits scout/planner roles; build permits scout/planner/worker/reviewer for complete development workflows. The trusted subagent extension must force scout/planner to read-only tools in both plan and build; worker/reviewer keep their role's builtin tools. Full enables all registered, nonhidden tools. This is a model execution policy, **not an operating-system sandbox**.
 - Background running conversations receive bounded history prefetch using the existing sidebar poll, without extra SSE streams or starting sessions. Hidden/offline pages pause prefetch. History revisions include the effective upstream notices switch: toggling it invalidates cached messages, while unchanged validation reads only the switch and skips notice scans. Notices settings reads are bounded and non-blocking for both global and project files.
 - Reasoning controls use one capability-driven menu. Supported off/on/effort options can save exact SDK-native per-model defaults. Ordinary selections remain session-scoped; model changes restore the target model's saved default without transient display mismatches. Reselecting the current model refreshes saved definitions without reapplying its default effort; native capability clamping and newer explicit effort changes remain authoritative.
+- Completion chimes and browser notifications require an observed SDK run and fire exactly once after it settles or is confirmed idle. Handled commands with no run announce nothing; a command handing off a run cannot announce early on `prompt_done`. Stopped runs and unsettled built-in subagent families retain their notification suppression.
 
 Design details and regression boundaries are in [tool policy](agents/tools.md), [sessions](agents/sessions.md), and [models](agents/models.md).
 
@@ -17,4 +18,4 @@ Design details and regression boundaries are in [tool policy](agents/tools.md), 
 
 This repository contains application code, portable tests, and generic documentation. Machine-specific build/activation helpers, service launchers, deployment records, real configuration, credentials, and sessions are maintained **outside this repository**.
 
-Use the development and test commands in the [README](../README.md). Do not run production builds over a live development or deployed `.next` directory. Publishing this source does not deploy a service or publish an npm package.
+Use the development and test commands in the [README](../README.md). Do not run production builds over a live development or deployed `.next` directory. Publishing this source does not deploy a service or publish an npm package. The npm publish workflow is restricted at job level to `agegr/pi-web`; tags on personal forks cannot publish under the retained upstream package name.

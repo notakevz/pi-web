@@ -15,15 +15,20 @@ const cases = ["agent_end", "auto_retry_start", "agent_start", "auto_retry_end"]
   assert.ok(clause, `missing case ${type}`);
   return clause.getText(source);
 });
+const observe = nodes.find((node) => ts.isVariableDeclaration(node) && node.name.getText(source) === "observeSdkAgentRun");
+const observeRun = new Script(ts.transpileModule(`(${observe.initializer.arguments[0].getText(source)})`, { compilerOptions: { target: ts.ScriptTarget.ESNext } }).outputText);
 const handler = new Script(ts.transpileModule(`((event) => { switch (event.type) { ${cases.join("\n")} } })`, { compilerOptions: { target: ts.ScriptTarget.ESNext } }).outputText);
 
 function setup() {
   const banner = { current: null };
   const context = createContext({
     agentRunningRef: { current: true }, sdkAgentActiveRef: { current: true }, sessionIdRef: { current: null },
+    agentRunNeedsCompletionRef: { current: true }, agentRunEndRef: { current: { aborted: false } },
+    sdkAgentGenerationRef: { current: 0 }, notifiedPromptRunIdRef: { current: -1 },
     setRetryInfo: (value) => { banner.current = value; },
-    cancelEventStreamGrace() {}, setAgentRunning() {}, setAgentPhase() {}, dispatch() {},
+    cancelEventStreamGrace() {}, setAgentRunning() {}, setAgentPhase() {}, dispatch() {}, markPromptLanded() {},
   });
+  context.observeSdkAgentRun = observeRun.runInContext(context);
   return { handle: handler.runInContext(context), banner };
 }
 

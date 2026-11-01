@@ -25,7 +25,10 @@ for (const status of [200, 404, 500]) {
     let release, stateReads = 0, detailReads = 0;
     const unexpected = [];
     const gate = new Promise((resolve) => { release = resolve; });
-    globalThis.fetch = async (url) => {
+    globalThis.fetch = async (url, init = {}) => {
+      if (url === `/api/agent/${id}/lease` && init.method === "POST") {
+        return Response.json({ success: true, running: false, awaitingInput: false, subagentsActive: false });
+      }
       if (url.startsWith(`/api/sessions/${id}?`)) {
         detailReads++;
         await gate;
