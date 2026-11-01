@@ -13,9 +13,10 @@ import {
 } from "./subagents";
 import { MAX_SUBAGENT_INPUT_BYTES, MAX_SUBAGENT_INPUT_FILES } from "./subagent-input";
 import { worktreeHasUncommittedFiles } from "./worktree";
+import { HOST_SUBAGENT_EXTENSION_PATH, type LocalToolMode } from "./local-tool-modes";
+import { localSubagentBuiltins } from "./local-subagent-policy";
 
 export const HOST_SUBAGENT_EXTENSION_NAME = "pi-web-subagents";
-const HOST_SUBAGENT_EXTENSION_PATH = `<inline:${HOST_SUBAGENT_EXTENSION_NAME}>`;
 const SUBAGENT_TOOL_NAMES = new Set<string>(SUBAGENT_CONTROL_TOOL_NAMES);
 const LEGACY_SUBAGENT_PACKAGE_NAME = "pi-subagents";
 const TERMINAL_SUBAGENT_STATUSES = new Set<SubagentRunInfo["status"]>(["completed", "failed", "aborted", "interrupted"]);
@@ -142,19 +143,20 @@ export interface SubagentExtensionRuntime {
   start(request: StartSubagentRequest): Promise<SubagentExecution>;
   resume(request: ResumeSubagentRequest): Promise<SubagentExecution>;
   get(sessionId: string): Promise<SubagentRunInfo | null>;
-  steer(sessionId: string, message: string): Promise<void>;
+  steer(sessionId: string, message: string, parentContext?: ExtensionContext): Promise<void>;
   notifyParent(run: SubagentRunInfo): Promise<void>;
   markResultConsumed(run: Pick<SubagentRunInfo, "sessionId" | "completedAt">): void;
 }
 
-export type SubagentProfileProvider = () => readonly SubagentProfile[];
+export type SubagentProfileProvider = (ctx?: ExtensionContext) => readonly SubagentProfile[];
 export type SubagentEnabledProvider = () => boolean;
 
-function agentTypeDescription(profiles: readonly SubagentProfile[]): string {
+function agentTypeDescription(profiles: readonly SubagentProfile[], mode: LocalToolMode): string {
   const available = profiles.filter((profile) => profile.enabled);
   if (available.length === 0) return "No subagent profiles are currently enabled.";
   return available.map((profile) => {
-    const details = [`Tools: ${profile.tools.length > 0 ? profile.tools.join(", ") : "none"}`];
+    const tools = mode === "plan" || mode === "build" ? localSubagentBuiltins(profile) : profile.tools;
+    const details = [`Tools: ${tools.length > 0 ? tools.join(", ") : "none"}`];
     if (profile.model) details.push(`Model: ${profile.model}`);
     if (profile.thinking) details.push(`Thinking: ${profile.thinking}`);
     return `- ${profile.name}: ${profile.description} (${details.join("; ")})`;
@@ -236,19 +238,31 @@ export function createSubagentExtension(
   runtime: SubagentExtensionRuntime,
   getProfiles: SubagentProfileProvider,
   isEnabled: SubagentEnabledProvider = () => true,
+  getMode: (ctx?: ExtensionContext) => LocalToolMode = () => "full",
 ): InlineExtension {
   return {
     name: HOST_SUBAGENT_EXTENSION_NAME,
     hidden: true,
     factory: (pi) => {
       if (!isEnabled()) return;
-      const profiles = getProfiles().filter((profile) => profile.enabled);
-      const profileNames = profiles.map((profile) => profile.name);
-      const availableTypes = profileNames.length > 0 ? profileNames.join(", ") : "none";
+      const description = () => `Delegate a focused task to a configured subagent. Each subagent runs as a full, inspectable Pi session. Use background mode for independent work and foreground mode when the result is needed immediately. Foreground completion waits default to 30 minutes; set wait_timeout (seconds) for longer tasks. If the wait budget is exhausted, the child keeps running and reports its completion automatically.\n\nAvailable agent types:\n${agentTypeDescription(getProfiles(), getMode())}`;
+      const assertOwned = (run: SubagentRunInfo, ctx: ExtensionContext) => {
+        if (!ctx?.sessionManager || run.parentSessionId !== ctx.sessionManager.getSessionId()) {
+          throw new Error(`Subagent ${run.sessionId} does not belong to this parent session.`);
+        }
+      };
+      const getOwned = async (sessionId: string, ctx: ExtensionContext) => {
+        const run = await runtime.get(sessionId);
+        if (run) assertOwned(run, ctx);
+        return run;
+      };
       pi.registerTool(defineTool({
         name: "Agent",
         label: "Agent",
-        description: `Delegate a focused task to a configured subagent. Each subagent runs as a full, inspectable Pi session. Use background mode for independent work and foreground mode when the result is needed immediately. Foreground completion waits default to 30 minutes; set wait_timeout (seconds) for longer tasks. If the wait budget is exhausted, the child keeps running and reports its completion automatically.\n\nAvailable agent types:\n${agentTypeDescription(profiles)}`,
+        description: description(),
+        // setActiveTools re-runs this hook, including same-set changes of mode.
+        // The RPC provider reads the live selection, never a factory-time list.
+        prepareLoadout: () => ({ descriptions: { Agent: description() } }),
         promptSnippet: "Delegate a focused task to an inspectable subagent session",
         exposure: SUBAGENT_TOOL_EXPOSURE,
         promptGuidelines: [
@@ -258,7 +272,7 @@ export function createSubagentExtension(
         ],
         executionMode: "parallel",
         parameters: Type.Object({
-          subagent_type: Type.Optional(Type.String({ description: `Configured agent profile. Available types: ${availableTypes}. Default: general-purpose.` })),
+          subagent_type: Type.Optional(Type.String({ description: "Configured agent profile. See Available agent types in the tool description. Defaults to scout in plan, worker in build, and general-purpose in full; specify a profile if that default is unavailable." })),
           prompt: Type.String({ description: "The complete task for the subagent." }),
           resume: Type.Optional(Type.String({ description: "Existing session ID to continue with its current profile, model, thinking, and context. Omit new-session options." })),
           input_files: Type.Optional(Type.Array(Type.String(), {
@@ -299,7 +313,18 @@ export function createSubagentExtension(
           };
           try {
             const timeoutMs = waitTimeoutMs(params.wait_timeout);
+            if (!isEnabled()) throw new Error("Built-in subagents are disabled. Reload the session to update its tools.");
             const resume = params.resume?.trim();
+            const mode = getMode(ctx);
+            const limited = mode === "plan" || mode === "build";
+            const profile = params.subagent_type ?? (mode === "plan" ? "scout" : mode === "build" ? "worker" : "general-purpose");
+            if (limited) {
+              const profiles = getProfiles(ctx).filter((candidate) => candidate.enabled);
+              const selected = resume ? (await getOwned(resume, ctx))?.profile : profile;
+              if (!selected || !profiles.some((candidate) => candidate.name.toLowerCase() === selected.trim().toLowerCase())) {
+                throw new Error(`Subagent profile "${selected ?? resume}" is unavailable in ${mode} mode. Choose an enabled user-level role from Available agent types.`);
+              }
+            }
             if (resume) {
               const creationOptions = [
                 params.model?.trim() && "model",
@@ -324,7 +349,7 @@ export function createSubagentExtension(
               : await runtime.start({
               parentContext: ctx,
               parentToolCallId: toolCallId,
-              profile: params.subagent_type ?? "general-purpose",
+              profile,
               task: params.prompt,
               ...(params.input_files ? { inputFiles: params.input_files } : {}),
               description: params.description,
@@ -379,13 +404,13 @@ export function createSubagentExtension(
           wait: Type.Optional(Type.Boolean({ description: "Wait for completion within the wait_timeout budget (default 30 minutes). If still active, return status without cancelling the child." })),
           wait_timeout: waitTimeoutParameter(),
         }),
-        async execute(_toolCallId, params, signal) {
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           let run: SubagentRunInfo | null | undefined;
           if (params.wait) {
             const timeoutMs = waitTimeoutMs(params.wait_timeout);
             const settled = await waitForSubagent(async (pollSignal) => {
               for (;;) {
-                const found = await runtime.get(params.agent_id);
+                const found = await getOwned(params.agent_id, ctx);
                 pollSignal.throwIfAborted();
                 run = found;
                 if (!run || TERMINAL_SUBAGENT_STATUSES.has(run.status)) return { run };
@@ -398,7 +423,7 @@ export function createSubagentExtension(
             };
             run = settled.run;
           } else {
-            run = await runtime.get(params.agent_id);
+            run = await getOwned(params.agent_id, ctx);
           }
           if (!run) return { content: [{ type: "text", text: `Subagent not found: ${params.agent_id}` }], details: undefined, isError: true };
           // A foreground call that hit its wait limit also owes a completion notification.
@@ -421,9 +446,11 @@ export function createSubagentExtension(
           agent_id: Type.String({ description: "Subagent session ID." }),
           message: Type.String({ description: "Instruction to inject after the current tool execution." }),
         }),
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
           try {
-            await runtime.steer(params.agent_id, params.message);
+            const run = await getOwned(params.agent_id, ctx);
+            if (!run) throw new Error(`Subagent not found: ${params.agent_id}`);
+            await runtime.steer(params.agent_id, params.message, ctx);
             return { content: [{ type: "text", text: `Steering message sent to ${params.agent_id}.` }], details: undefined };
           } catch (error) {
             return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: undefined, isError: true };

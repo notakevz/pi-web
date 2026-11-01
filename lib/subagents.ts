@@ -10,6 +10,7 @@ import { isExistingPathWithinRoots } from "./path-security";
 import { disabledBuiltInSubagents } from "./subagent-settings";
 import { PRESET_READ_ONLY } from "./tool-presets";
 import type { SessionEntry, SubagentSessionStatus } from "./types";
+import { localSubagentExtensionPaths, localSubagentResourcesMatch, parseLocalSubagentPolicy, type LocalSubagentPolicy } from "./local-subagent-policy";
 
 export const SUBAGENT_META_TYPE = "pi-web:subagent";
 export const SUBAGENT_STATUS_TYPE = "pi-web:subagent-status";
@@ -72,6 +73,8 @@ export interface SubagentMetadata {
 
 export interface SubagentResourceSnapshot {
   version: 1;
+  /** Explicit local provenance; absent on upstream/full and historical snapshots. */
+  localPolicy?: LocalSubagentPolicy;
   skills?: string[];
   extensions?: string[];
   appendSystemPrompt: string[];
@@ -86,6 +89,7 @@ export interface SubagentResourceSnapshot {
 }
 
 export interface SubagentSessionResources {
+  localPolicy?: LocalSubagentPolicy;
   skills?: string[];
   extensions?: string[];
   appendSystemPrompt: string[];
@@ -474,13 +478,18 @@ function builtInProfiles(): SubagentProfile[] {
   }));
 }
 
-/** Every configured source, including profiles shadowed by a higher-precedence scope. */
-export function listSubagentProfileSources(cwd: string): SubagentProfile[] {
+/** Raw sources in upstream override order, BEFORE project/workspace name overrides or UI sorting. */
+export function getAllSubagentProfiles(cwd: string): SubagentProfile[] {
   const profiles = builtInProfiles();
   for (const [dir, scope] of profileDirectories(cwd)) {
     profiles.push(...readProfileDirectory(dir, scope, cwd));
   }
-  return profiles.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  return profiles;
+}
+
+/** Every configured source, including shadowed profiles, sorted for the Agents panel. */
+export function listSubagentProfileSources(cwd: string): SubagentProfile[] {
+  return getAllSubagentProfiles(cwd).sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
 export function listSubagentProfiles(cwd: string): SubagentProfile[] {
@@ -672,6 +681,9 @@ export function readSubagentSessionResources(
   const data = subagentMetadataData(entries);
   if (!data) return null;
   const snapshot = data.resourceSnapshot;
+  const hasLocalPolicy = isRecord(snapshot) && "localPolicy" in snapshot;
+  const localPolicy = hasLocalPolicy ? parseLocalSubagentPolicy(snapshot.localPolicy) : null;
+  if (hasLocalPolicy && (!localPolicy || typeof data.profile !== "string" || data.profile.toLowerCase() !== localPolicy.role)) return null;
   // A malformed list narrows to what it names, never back to the whole catalog.
   const skills = isRecord(snapshot) && "skills" in snapshot ? subagentNameList(snapshot.skills) : undefined;
   const extensions = isRecord(snapshot) && "extensions" in snapshot ? subagentNameList(snapshot.extensions) : undefined;
@@ -691,10 +703,11 @@ export function readSubagentSessionResources(
       typeof item === "string"
       && item.length > 0
       && !SUBAGENT_CONTROL_TOOLS.has(item)
-      && ((item === "codemode" && codemode) || SNAPSHOT_BUILTIN_TOOLS.has(item) || loadExtensions)
+      && ((item === "codemode" && codemode) || SNAPSHOT_BUILTIN_TOOLS.has(item) || loadExtensions || (item === "webfetch" && localPolicy?.webfetch === true))
     )
   ) {
-    return {
+    const resources: SubagentSessionResources = {
+      ...(localPolicy ? { localPolicy } : {}),
       ...(skills !== undefined ? { skills } : {}),
       ...(extensions !== undefined ? { extensions } : {}),
       appendSystemPrompt: [...snapshot.appendSystemPrompt],
@@ -706,6 +719,10 @@ export function readSubagentSessionResources(
       ...(loadExtensions && snapshot.allExtensionTools === true ? { allExtensionTools: true as const } : {}),
       ...(typeof snapshot.exactSystemPrompt === "string" ? { exactSystemPrompt: snapshot.exactSystemPrompt } : {}),
     };
+    if (localPolicy && (!localSubagentResourcesMatch(resources, localPolicy)
+      || snapshot.loadSkills !== false || snapshot.loadExtensions !== false
+      || "codemode" in snapshot || "mcp" in snapshot || "allExtensionTools" in snapshot)) return null;
+    return resources;
   }
   return null;
 }
@@ -951,7 +968,14 @@ export function scopeSubagentExtensions(names: readonly string[]) {
 export const SUBAGENT_MCP_EXTENSION_PATHS: readonly string[] = ["builtin:tool-search", "builtin:mcp"];
 
 /** The extension half of a child's resource loader options, shared by spawn and reopen. */
-export function subagentExtensionLoaderOptions(resources: { loadExtensions: boolean; extensions?: readonly string[]; mcp?: boolean }) {
+export function subagentExtensionLoaderOptions(resources: { loadExtensions: boolean; extensions?: readonly string[]; mcp?: boolean; localPolicy?: LocalSubagentPolicy }) {
+  if (resources.localPolicy) {
+    return {
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noContextFiles: true, noThemes: true,
+      // Explicit paths load even with noExtensions. No discovery/configured factory imports.
+      additionalExtensionPaths: localSubagentExtensionPaths(resources.localPolicy),
+    };
+  }
   return {
     noExtensions: !resources.loadExtensions,
     ...(resources.mcp ? { additionalExtensionPaths: [...SUBAGENT_MCP_EXTENSION_PATHS] } : {}),

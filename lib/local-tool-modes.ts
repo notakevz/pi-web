@@ -6,12 +6,22 @@ export const LOCAL_BUILD_TOOLS = ["read", "bash", "edit", "write"];
 const CODING_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
 const SUBAGENT_MARKER = "In plan/build, children cannot load extensions or MCP";
 const WEBFETCH_MARKER = "Read-only webfetch:";
+export const HOST_SUBAGENT_EXTENSION_PATH = "<inline:pi-web-subagents>";
+const HOST_SUBAGENT_TOOLS = new Set(["Agent", "get_subagent_result", "steer_subagent"]);
 
 export interface LocalModeTool {
   name: string;
   description: string;
   exposure?: string;
   annotations?: { readOnlyHint?: boolean };
+  sourceInfo?: unknown;
+}
+
+/** SDK getAllTools() supplies the registering extension's path, not its tool name. */
+export function isHostSubagentTool(tool: LocalModeTool): boolean {
+  const source = tool.sourceInfo;
+  return HOST_SUBAGENT_TOOLS.has(tool.name) && typeof source === "object" && source !== null
+    && "path" in source && source.path === HOST_SUBAGENT_EXTENSION_PATH;
 }
 
 export type LocalToolMode = "none" | "plan" | "build" | "full" | "restricted";
@@ -49,18 +59,22 @@ export function localToolPolicy(
     : key === "find,grep,ls,read" ? "plan"
     : key === "bash,edit,read,write" ? "build"
     : key === "bash,edit,find,grep,ls,read,write" ? "full" : "restricted";
-  const visible = tools.filter((tool) => tool.exposure !== "hidden");
+  const hostPresent = tools.some((tool) => tool.exposure !== "hidden" && isHostSubagentTool(tool));
+  // Keep legacy factories registered (and terminal settings untouched), but the
+  // Web host supersedes the external dispatcher in every mode, including full.
+  const visible = tools.filter((tool) => tool.exposure !== "hidden" && !(hostPresent && tool.name === "subagent"));
   if (mode === "none") return { mode, builtins, active: [] };
   if (mode === "full") return { mode, builtins, active: preserveAllowedToolOrder(visible.map((tool) => tool.name), carry) };
   const extras = mode === "plan" || mode === "build"
-    ? visible.filter(isLimitedModeExtra).map((tool) => tool.name)
+    ? visible.filter((tool) => isLimitedModeExtra(tool, hostPresent)).map((tool) => tool.name)
     // Preserve the upstream carry rule for legacy, non-preset selections.
-    : carryCodingToolSelection(selection, tools, carry, defaultTools).filter((name) => !CODING_TOOLS.has(name));
+    : carryCodingToolSelection(selection, visible, carry, defaultTools).filter((name) => !CODING_TOOLS.has(name));
   return { mode, builtins, active: preserveAllowedToolOrder([...new Set([...builtins, ...extras])], carry) };
 }
 
-function isLimitedModeExtra(tool: LocalModeTool): boolean {
-  return tool.name === "subagent" && tool.description.includes(SUBAGENT_MARKER)
+function isLimitedModeExtra(tool: LocalModeTool, hostPresent: boolean): boolean {
+  return hostPresent && isHostSubagentTool(tool)
+    || !hostPresent && tool.name === "subagent" && tool.description.includes(SUBAGENT_MARKER)
     || tool.name === "webfetch" && tool.annotations?.readOnlyHint === true && tool.description.includes(WEBFETCH_MARKER);
 }
 
@@ -78,14 +92,27 @@ export function localToolCallBlockReason(
 ): string | undefined {
   const tool = tools.find((candidate) => candidate.name === toolName && candidate.exposure !== "hidden");
   if (!tool) return `Tool "${toolName}" is unavailable in this session.`;
+  if (toolName === "subagent" && tools.some((candidate) => candidate.exposure !== "hidden" && isHostSubagentTool(candidate))) {
+    return "The external subagent tool is disabled while Pi Web's built-in subagents are enabled. Use Agent instead.";
+  }
   if (policy.mode === "full") return undefined;
   const limited = policy.mode === "plan" || policy.mode === "build";
   const permitted = policy.builtins.includes(toolName) || limited && policy.active.includes(toolName);
   if (policy.mode === "none" || !permitted) {
     return `Tool "${toolName}" is disabled in this session's ${policy.mode} mode.`;
   }
-  if (!limited || toolName !== "subagent") return undefined;
+  if (!limited) return undefined;
   const roles = policy.mode === "plan" ? ["scout", "planner"] : ["scout", "planner", "worker", "reviewer"];
+  if (isHostSubagentTool(tool) && toolName === "Agent") {
+    const params = input as { subagent_type?: unknown; resume?: unknown } | null;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return "Invalid plan/build subagent request.";
+    if (!params.resume && params.subagent_type !== undefined
+      && (typeof params.subagent_type !== "string" || !roles.includes(params.subagent_type.trim().toLowerCase()))) {
+      return `This mode only permits subagent roles: ${roles.join(" / ")}`;
+    }
+    return undefined; // The host validates effective profile/source and resume at dispatch.
+  }
+  if (toolName !== "subagent") return undefined;
   const params = input as { agentScope?: unknown; agent?: unknown; tasks?: unknown; chain?: unknown } | null;
   if (!params || typeof params !== "object" || Array.isArray(params)) return "Invalid plan/build subagent request.";
   if (params.agentScope !== undefined && params.agentScope !== "user") return "plan/build subagents must use user-level roles.";

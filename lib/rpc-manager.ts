@@ -1,5 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createLocalSubagentServices } from "./local-subagent-services";
+import { createAgentSessionFromServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -39,7 +40,7 @@ import {
   preferPiWebSubagentExtension,
 } from "./subagent-extension";
 import {
-  listSubagentProfiles,
+  getAllSubagentProfiles,
   hasSubagentResourceSnapshot,
   readSubagentRun,
   readSubagentSessionResources,
@@ -51,6 +52,7 @@ import {
 import { createSubagentController, getLiveSubagentStatus, hasUnsettledSubagentRun } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { carryCodingToolSelection, localToolPolicy, preserveAllowedToolOrder } from "./local-tool-modes";
+import { createLocalSubagentPolicyExtension, filterLocalSubagentProfiles, localSubagentMode } from "./local-subagent-policy";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
 import { createPiWebBuiltinExtensions, createSubagentCodemodeExtension, createSubagentMcpExtensions } from "./builtin-extensions";
@@ -3142,8 +3144,9 @@ export async function startRpcSession(
         ? [...subagentMcp.extensions, createSubagentMcpPolicyExtension(() => subagentResources)]
         : []),
       ...(skillsBinding?.loaderOptions.extensionFactories ?? []),
+      ...(subagentResources?.localPolicy ? [createLocalSubagentPolicyExtension(subagentResources.localPolicy)] : []),
     ];
-    const services = await createAgentSessionServices({
+    const services = await createLocalSubagentServices({
       cwd: sessionCwd,
       agentDir,
       settingsManager,
@@ -3175,14 +3178,20 @@ export async function startRpcSession(
               }),
               createSubagentExtension(
                 SUBAGENT_CONTROLLER.extensionRuntime,
-                () => listSubagentProfiles(sessionCwd),
+                (ctx) => filterLocalSubagentProfiles(
+                  getAllSubagentProfiles(sessionCwd),
+                  readSessionToolSelection((ctx?.sessionManager ?? sessionManager).getEntries() as unknown as SessionEntry[]),
+                ),
                 isBuiltInSubagentsEnabled,
+                (ctx) => localSubagentMode(readSessionToolSelection(
+                  (ctx?.sessionManager ?? sessionManager).getEntries() as unknown as SessionEntry[],
+                )),
               ),
             ],
             extensionsOverride: (base) => preferUserBashExtension(preferPiWebSubagentExtension(base)),
           },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
-    });
+    }, subagentResources?.localPolicy);
     if (subagentResources?.codemode
       && !services.resourceLoader.getExtensions().extensions.some((extension) => extension.tools.has("codemode"))) {
       throw new Error("Code mode is unavailable: builtin:codemode was not registered");

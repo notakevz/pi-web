@@ -1,14 +1,15 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   createAgentSessionFromServices,
-  createAgentSessionServices,
   getAgentDir,
   initTheme,
   SessionManager,
   SettingsManager,
   type ModelRuntime,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike } from "./pi-types";
+import { createLocalSubagentServices } from "./local-subagent-services";
 import {
   subagentNotificationText,
   subagentToolDetails,
@@ -19,7 +20,8 @@ import {
 } from "./subagent-extension";
 import {
   readSubagentRun,
-  resolveSubagentProfile,
+  readSubagentSessionResources,
+  getAllSubagentProfiles,
   SUBAGENT_META_TYPE,
   SUBAGENT_STATUS_TYPE,
   SUBAGENT_RESULT_TYPE,
@@ -44,9 +46,15 @@ import { createSubagentMcpPolicyExtension } from "./mcp-read-only-policy";
 import { resolveShellTools } from "./powershell-settings";
 import { isBuiltInSubagentsEnabled, readSubagentSettings } from "./subagent-settings";
 import { SubagentQueue } from "./subagent-queue";
+import { serializeByKey } from "./key-serializer";
 import { addWorktree, removeWorktree } from "./worktree";
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
+import { readSessionToolSelection } from "./session-tool-selection";
+import {
+  assertLocalSubagentContinuation, createLocalSubagentPolicy, createLocalSubagentPolicyExtension,
+  filterLocalSubagentProfiles, localSubagentMode,
+} from "./local-subagent-policy";
 
 interface HostSession {
   readonly inner: AgentSessionLike;
@@ -77,7 +85,7 @@ export interface SubagentRuntimeDependencies {
 export interface SubagentController {
   readonly extensionRuntime: SubagentExtensionRuntime;
   get(sessionId: string): Promise<SubagentRunInfo | null>;
-  steer(sessionId: string, message: string): Promise<void>;
+  steer(sessionId: string, message: string, parentContext?: ExtensionContext): Promise<void>;
   abort(sessionId: string): Promise<void>;
 }
 
@@ -106,6 +114,7 @@ declare global {
   var __piSubagentConsumedResults: Map<string, string> | undefined;
   var __piSubagentParentNotifications: Set<ParentNotification> | undefined;
 }
+const RESUME_ADMISSION_LOCK = Symbol.for("pi-web.subagent-resume-admission");
 const SUBAGENT_CONTEXT_LIMIT = 50_000;
 const PARENT_IDLE_POLL_MS = 200;
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -432,8 +441,20 @@ export function createSubagentController(
 
     let isolatedWorktree: { path: string; branch: string } | undefined;
     try {
-      const profile = resolveSubagentProfile(parent.cwd, request.profile);
-      if (!profile) throw new Error(`Unknown or disabled subagent profile: ${request.profile}`);
+      const parentEntries = parent.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+      if (readSubagentSessionResources(parentEntries)?.localPolicy) throw new Error("Limited subagents cannot delegate");
+      const selection = readSessionToolSelection(parentEntries);
+      const mode = localSubagentMode(selection);
+      const sourceProfile = filterLocalSubagentProfiles(getAllSubagentProfiles(parent.cwd), selection)
+        .find((item) => item.name.toLowerCase() === request.profile.trim().toLowerCase());
+      if (!sourceProfile) throw new Error(`Unknown, disabled, or disallowed subagent profile: ${request.profile}`);
+      const localPolicy = mode === "plan" || mode === "build" ? createLocalSubagentPolicy(sourceProfile, mode) : undefined;
+      // Narrow BEFORE services/resource loading: dropping already imported extensions is too late.
+      const profile = localPolicy ? {
+        ...sourceProfile, tools: [...localPolicy.builtins], loadExtensions: false, loadSkills: false,
+        extensions: undefined, skills: undefined, extensionTools: undefined, disallowedExtensionTools: undefined,
+        codemode: "off" as const, mcp: "off" as const,
+      } : sourceProfile;
 
       const runInBackground = request.runInBackground ?? profile.runInBackground;
       const isolation = profile.isolation === "off" ? undefined : request.isolation ?? profile.isolation;
@@ -453,6 +474,7 @@ export function createSubagentController(
 
       const agentDir = getAgentDir();
       const settingsManager = SettingsManager.create(childCwd, agentDir);
+      if (localPolicy) localPolicy.builtins = resolveShellTools(localPolicy.builtins, settingsManager.getDefaultTools());
       const inheritedParentContext = inheritContext
         ? `The following is the active conversation context from the parent session. Use it only as background for the delegated task:\n${parentContextText(parent)}`
         : undefined;
@@ -506,15 +528,16 @@ export function createSubagentController(
         ...(codemodeExtension ? [codemodeExtension] : []),
         ...(mcp ? [...mcp.extensions, createSubagentMcpPolicyExtension(() => mcpScope)] : []),
         ...(skillsBinding.loaderOptions.extensionFactories ?? []),
+        ...(localPolicy ? [createLocalSubagentPolicyExtension(localPolicy)] : []),
       ];
       if (!chatOnly) initTheme();
-      const services = await createAgentSessionServices({
+      const services = await createLocalSubagentServices({
         cwd: childCwd,
         agentDir,
         modelRuntime: parentModelRuntime,
         settingsManager,
         resourceLoaderOptions: {
-          ...subagentExtensionLoaderOptions({ ...profile, mcp: mcpEnabled }),
+          ...subagentExtensionLoaderOptions({ ...profile, mcp: mcpEnabled, localPolicy }),
           ...skillsBinding.loaderOptions,
           ...(extensionFactories.length > 0 ? { extensionFactories } : {}),
           noPromptTemplates: true,
@@ -531,7 +554,7 @@ export function createSubagentController(
         ...((profile.loadExtensions || profile.loadSkills || codemodeEnabled || mcpEnabled)
           ? { resourceLoaderReloadOptions: projectTrustReloadOptions(childCwd, agentDir) }
           : {}),
-      });
+      }, localPolicy);
 
       if (codemodeEnabled && !services.resourceLoader.getExtensions().extensions.some((extension) => extension.tools.has("codemode"))) {
         throw new Error("Code mode is unavailable: builtin:codemode was not registered");
@@ -552,6 +575,11 @@ export function createSubagentController(
         withSubagentExtensionTools(profile.tools, extensionToolNames),
         settingsManager.getDefaultTools(),
       );
+      if (localPolicy) {
+        // Shell preference resolution is part of the saved builtin ceiling, not an extension grant.
+        localPolicy.builtins = [...activeTools];
+        if (localPolicy.webfetch) activeTools.push("webfetch");
+      }
       if (codemodeEnabled && !activeTools.includes("codemode")) activeTools.push("codemode");
       mcpScope.tools = activeTools;
       mcpScope.allExtensionTools = allExtensionTools;
@@ -572,6 +600,7 @@ export function createSubagentController(
         createdAt,
         resourceSnapshot: {
           version: 1,
+          ...(localPolicy ? { localPolicy } : {}),
           appendSystemPrompt: [...appendSystemPrompt],
           tools: [...activeTools],
           ...(codemodeEnabled ? { codemode: true as const } : {}),
@@ -823,6 +852,12 @@ export function createSubagentController(
   }
 
   async function resume(request: ResumeSubagentRequest): Promise<SubagentExecution> {
+    // Serialize admission only: once queued, the run map prevents another resume while the
+    // child works. Never hold this lock for the child's completion (or its parent's queue).
+    return serializeByKey(RESUME_ADMISSION_LOCK, request.sessionId, () => admitResume(request));
+  }
+
+  async function admitResume(request: ResumeSubagentRequest): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
@@ -834,10 +869,21 @@ export function createSubagentController(
     if (!parent?.isAlive()) throw new Error("Parent session is no longer available");
     const sessionPath = existing.sessionPath || await dependencies.resolveSessionPath(request.sessionId);
     if (!sessionPath) throw new Error(`Subagent session file not found: ${request.sessionId}`);
+    // Disk-only inspection precedes reopen, which can import resources and connect services.
+    assertContinuation(parent, sessionPath, request.sessionId, parentSessionId);
     let wrapper = dependencies.getSession(request.sessionId);
     if (!wrapper?.isAlive()) wrapper = await dependencies.reopenSession(request.sessionId, sessionPath);
+    // Reopen can await resource loading while the parent closes or changes modes. Keep the
+    // pre-reopen check above to prevent unauthorized imports, then revalidate admission against
+    // the current owner/parent/policy before touching the run map or queue. Already admitted
+    // children retain their saved ceiling; a mode change never mutates them.
+    const current = await get(request.sessionId);
+    if (!current || current.parentSessionId !== parentSessionId) throw new Error("Subagent does not belong to this parent session");
+    const currentParent = dependencies.getSession(parentSessionId);
+    if (!currentParent?.isAlive()) throw new Error("Parent session is no longer available");
+    assertContinuation(currentParent, sessionPath, request.sessionId, parentSessionId);
     if (!wrapper.isAlive()) throw new Error("Subagent session is no longer available");
-    if (wrapper.isRunning()) throw new Error("Subagent is already running");
+    if (current.status === "running" || current.status === "queued" || wrapper.isRunning()) throw new Error("Subagent is already running");
     // The run prompts the SDK session directly, past the wrapper's `send()`, so refuse here as
     // `send()` does: an isolated child's worktree is removed when its run ends, and a run in the
     // missing folder would only let the model's tools fail (and `write` recreate it outside git).
@@ -983,8 +1029,31 @@ export function createSubagentController(
     return run && settleOrphanedRun(run);
   }
 
-  async function steer(sessionId: string, message: string): Promise<void> {
+  function assertContinuation(parent: HostSession, path: string, sessionId: string, parentSessionId: string): void {
+    const selection = readSessionToolSelection(parent.inner.sessionManager.getEntries() as unknown as SessionEntry[]);
+    const mode = localSubagentMode(selection);
+    // Full/profile behavior is unchanged. Only limited parents need disk provenance inspection.
+    if (mode !== "plan" && mode !== "build") {
+      assertLocalSubagentContinuation(null, selection, []);
+      return;
+    }
+    const entries = SessionManager.open(path).getEntries() as unknown as SessionEntry[];
+    const run = readSubagentRun(entries, sessionId, path);
+    if (!run || run.parentSessionId !== parentSessionId) throw new Error("Subagent does not belong to this parent session");
+    assertLocalSubagentContinuation(readSubagentSessionResources(entries), selection, getAllSubagentProfiles(parent.cwd));
+  }
+
+  async function steer(sessionId: string, message: string, parentContext?: ExtensionContext): Promise<void> {
     const wrapper = dependencies.getSession(sessionId);
+    // Legacy direct callers may omit ctx; infer the owning live parent, never assume full.
+    const run = await get(sessionId);
+    const parentSessionId = parentContext?.sessionManager.getSessionId() ?? run?.parentSessionId;
+    const parent = parentSessionId ? dependencies.getSession(parentSessionId) : undefined;
+    if (!parent?.isAlive() || !parentSessionId) throw new Error("Parent session is no longer available");
+    if (!run || run.parentSessionId !== parentSessionId) throw new Error("Subagent does not belong to this parent session");
+    const path = wrapper?.sessionFile || run.sessionPath || await dependencies.resolveSessionPath(sessionId);
+    if (!path) throw new Error("Subagent session file not found");
+    assertContinuation(parent, path, sessionId, parentSessionId);
     if (!wrapper?.isAlive() || !wrapper.isRunning()) throw new Error("Subagent is not running");
     if (getSubagentRuns().get(sessionId)?.turnLimitReached) throw new Error("Subagent reached its turn limit and is stopping; resume it to continue");
     if (!message.trim()) throw new Error("Steering message is required");

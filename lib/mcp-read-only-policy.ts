@@ -6,8 +6,9 @@ import type { SessionEntry } from "./types";
 import { localModeGuideline, localToolCallBlockReason, localToolPolicy } from "./local-tool-modes";
 
 // Normal sessions enforce the local plan/build/full policy below. Subagent
-// wrappers retain their profile-scoped MCP policy (ADR 0006). An annotation or
-// description marker is the trusted extension's word, not a security sandbox.
+// wrappers retain their profile-scoped MCP policy (ADR 0006). Host subagent
+// controls are identified by SDK source metadata; legacy extras still rely on
+// trusted annotation/description assertions, not a security sandbox.
 
 const WRITE_CAPABLE_TOOLS = new Set(["bash", "powershell", "edit", "write"]);
 const MCP_TOOL_PREFIX = "mcp__";

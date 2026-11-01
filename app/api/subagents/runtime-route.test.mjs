@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, {
@@ -8,6 +9,8 @@ const jiti = createJiti(import.meta.url, {
   moduleCache: false,
 });
 const { GET, POST } = await jiti.import("./[id]/route.ts");
+const { appendSessionToolSelection } = await jiti.import("../../../lib/session-tool-selection.ts");
+const { PRESET_FULL } = await jiti.import("../../../lib/tool-presets.ts");
 
 const id = "subagent-route-test";
 const context = { params: Promise.resolve({ id }) };
@@ -23,6 +26,9 @@ function request(body) {
 function installRunningSubagent(t) {
   const previousRegistry = globalThis.__piSessions;
   const previousRuns = globalThis.__piSubagentRuns;
+  const parentManager = SessionManager.inMemory(process.cwd());
+  appendSessionToolSelection(parentManager, PRESET_FULL);
+  const parentId = parentManager.getSessionId();
   let running = true;
   const steered = [];
   let aborts = 0;
@@ -34,7 +40,7 @@ function installRunningSubagent(t) {
     timestamp: "2026-01-01T00:00:00.000Z",
     data: {
       version: 1,
-      parentSessionId: "parent",
+      parentSessionId: parentId,
       parentSessionPath: "/tmp/parent.jsonl",
       parentToolCallId: "tool-call",
       profile: "Explore",
@@ -45,7 +51,13 @@ function installRunningSubagent(t) {
     },
   }];
   globalThis.__piSubagentRuns = new Map();
-  globalThis.__piSessions = new Map([[id, {
+  globalThis.__piSessions = new Map([[parentId, {
+    cwd: process.cwd(),
+    isAlive: () => true,
+    isRunning: () => false,
+    sessionFile: "/tmp/parent.jsonl",
+    inner: { sessionManager: parentManager },
+  }], [id, {
     isAlive: () => true,
     isRunning: () => running,
     sessionFile: `/tmp/${id}.jsonl`,
@@ -63,6 +75,7 @@ function installRunningSubagent(t) {
     steered,
     get aborts() { return aborts; },
     stop() { running = false; },
+    removeParent() { globalThis.__piSessions.delete(parentId); },
   };
 }
 
@@ -82,6 +95,16 @@ test("subagent route reads live state and accepts steer and abort actions", asyn
   const abortResponse = await POST(request({ action: "abort" }), context);
   assert.equal(abortResponse.status, 200);
   assert.equal(state.aborts, 1);
+});
+
+test("subagent route refuses steering without its owning live parent", async (t) => {
+  const state = installRunningSubagent(t);
+  state.removeParent();
+
+  const response = await POST(request({ action: "steer", message: "focus on tests" }), context);
+  assert.equal(response.status, 500);
+  assert.match((await response.json()).error, /Parent session is no longer available/);
+  assert.deepEqual(state.steered, []);
 });
 
 test("subagent route validates actions and rejects commands after completion", async (t) => {
