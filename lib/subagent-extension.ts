@@ -245,7 +245,7 @@ export function createSubagentExtension(
     hidden: true,
     factory: (pi) => {
       if (!isEnabled()) return;
-      const description = () => `Delegate a focused task to a configured subagent. Each subagent runs as a full, inspectable Pi session. Use background mode for independent work and foreground mode when the result is needed immediately. Foreground completion waits default to 30 minutes; set wait_timeout (seconds) for longer tasks. If the wait budget is exhausted, the child keeps running and reports its completion automatically.\n\nAvailable agent types:\n${agentTypeDescription(getProfiles(), getMode())}`;
+      const description = () => `Run a task in a configured subagent's separate, inspectable Pi session. Background mode returns immediately; foreground mode waits for completion. Foreground completion waits default to 30 minutes and are configurable with wait_timeout (seconds). If the wait budget is exhausted, the child keeps running and reports its completion automatically.\n\nAvailable agent types:\n${agentTypeDescription(getProfiles(), getMode())}`;
       const assertOwned = (run: SubagentRunInfo, ctx: ExtensionContext) => {
         if (!ctx?.sessionManager || run.parentSessionId !== ctx.sessionManager.getSessionId()) {
           throw new Error(`Subagent ${run.sessionId} does not belong to this parent session.`);
@@ -263,13 +263,8 @@ export function createSubagentExtension(
         // setActiveTools re-runs this hook, including same-set changes of mode.
         // The RPC provider reads the live selection, never a factory-time list.
         prepareLoadout: () => ({ descriptions: { Agent: description() } }),
-        promptSnippet: "Delegate a focused task to an inspectable subagent session",
+        promptSnippet: "Run a task in a separate, inspectable subagent session",
         exposure: SUBAGENT_TOOL_EXPOSURE,
-        promptGuidelines: [
-          "Use Agent for a focused task that benefits from an isolated context.",
-          "Use multiple background Agent calls in the same response for independent parallel work.",
-          "Do not duplicate work already delegated to a running subagent.",
-        ],
         executionMode: "parallel",
         parameters: Type.Object({
           subagent_type: Type.Optional(Type.String({ description: "Configured agent profile. See Available agent types in the tool description. Defaults to scout in plan, worker in build, and general-purpose in full; specify a profile if that default is unavailable." })),
