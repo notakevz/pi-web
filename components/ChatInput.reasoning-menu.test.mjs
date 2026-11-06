@@ -30,7 +30,7 @@ function compile(expression) {
 const control = compile(find(source, (node) => ts.isJsxExpression(node)
   && node.expression?.getText(source).startsWith('onThinkingLevelChange && thinkingMode !== "none"')).expression);
 const initializers = Object.fromEntries([
-  "THINKING_LEVEL_DESC_KEYS", "resolvedThinkingLevel", "effectiveThinkingLevel", "toggleSupported",
+  "controlSize", "THINKING_LEVEL_DESC_KEYS", "resolvedThinkingLevel", "effectiveThinkingLevel", "toggleSupported",
   "thinkingControl", "thinkingMode", "hasThinkingToggle", "thinkingToggleOn", "thinkingDisplayLabel",
   "thinkingTriggerLabel", "selectThinkingLevel",
 ].map((name) => [name, compile(find(source, (node) => ts.isVariableDeclaration(node) && node.name.getText(source) === name).initializer)]));

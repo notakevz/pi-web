@@ -68,6 +68,18 @@ export function appendSessionToolSelection(
   } satisfies SessionToolSelectionData);
 }
 
+/** The same entry for a session file written by hand (`createSideSession()`). */
+export function createSessionToolSelectionEntry(tools: readonly string[], id: string, parentId: string) {
+  return {
+    type: "custom",
+    customType: TOOL_SELECTION_TYPE,
+    data: { version: 1, tools: [...tools] } satisfies SessionToolSelectionData,
+    id,
+    parentId,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 /** Retract any earlier pin; ordinary sessions then use the local build policy. */
 export function appendClearedSessionToolSelection(sessionManager: SessionManager): void {
   sessionManager.appendCustomEntry(TOOL_SELECTION_TYPE, {

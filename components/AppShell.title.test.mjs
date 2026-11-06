@@ -28,7 +28,8 @@ test("layout metadata retains the upstream Pi Web page, Apple title and PWA bran
   assert.equal(value.title, "Pi Web");
   assert.equal(value.appleWebApp.title, "Pi Web");
   assert.equal(value.applicationName, "Pi Web");
-  assert.equal(value.manifest, "/manifest.webmanifest");
+  assert.equal(value.manifest, undefined, "manifest credentials are set on the explicit link");
+  assert.match(layout.text, /<link rel="manifest" href="\/manifest\.webmanifest" crossOrigin="use-credentials"\s*\/>/);
 });
 
 test("AppShell uses the upstream project title and retains its existing title observer", () => {

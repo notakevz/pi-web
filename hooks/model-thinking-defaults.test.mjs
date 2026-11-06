@@ -342,7 +342,12 @@ for (const canonicalFailure of [undefined, "http", "transport"]) {
     try {
       emit({ type: "agent_start" });
       emit({ type: "agent_end" });
+      // agent_end alone leaves the logical run active (retry/follow-up may
+      // continue it). Settle it so this case exercises idle canonical history,
+      // not the streaming switch's deliberately history-free live-state path.
+      emit({ type: "agent_settled" });
       await settle(); hook.flush();
+      assert.equal(hook.result.agentRunning, false);
       let finished = false;
       const switching = hook.result.handleModelChange(qwen.provider, qwen.modelId).then(() => { finished = true; });
       await settle(); hook.flush();
@@ -677,7 +682,11 @@ for (const canonicalFailure of [undefined, "http", "transport"]) {
     const { hook, emit } = await setup({ existing: true, backgroundReadGate, canonicalFailure });
     try {
       emit({ type: "agent_start" }); emit({ type: "agent_end" });
+      // Confirm idle before reselect: a still-active run confirms via live
+      // state instead, and must never replace its messages from history.
+      emit({ type: "agent_settled" });
       await settle(); hook.flush();
+      assert.equal(hook.result.agentRunning, false);
       await hook.result.handleThinkingLevelChange("xhigh"); hook.flush();
       let finished = false;
       const refreshing = hook.result.handleModelChange(gpt.provider, gpt.modelId).then(() => { finished = true; });

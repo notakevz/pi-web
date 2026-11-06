@@ -41,16 +41,16 @@ function setup(fetchImpl) {
     controller: new AbortController(),
     newSessionCwd: "/project", session: null, isNew: true,
     sessionIdRef: { current: null }, thinkingLevelOverrideRef: { current: null }, newSessionModelOverrideRef: { current: null },
-    thinkingLevelPinsRef: { current: {} }, defaultThinkingLevelRef: { current: null },
+    thinkingLevelPinsRef: { current: {} }, defaultThinkingLevelRef: { current: null }, allModelsLoadRef: { current: null },
     modelThinkingDefaultsRef: { current: {} }, modelThinkingLevelsRef: { current: {} },
-    modelThinkingDefault, clampSupportedThinkingLevel, defaultThinkingLevelFor: (supported) => supported?.includes("medium") ? "medium" : supported?.[0] ?? null,
+    modelThinkingDefault, clampSupportedThinkingLevel,
     asConcreteThinkingLevel: (value) => (!value || value === "auto" ? null : value),
     fetch: fetchImpl,
     missingCwdFromBody,
     MODELS_RETRY_DELAYS_MS: script(schedule.initializer.getText(source)).runInNewContext(),
     delay: async (ms) => { delays.push(ms); },
   };
-  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "ModelThinkingDefaults", "NewSessionModel", "NewSessionThinkingLevel"]) {
+  for (const name of ["ModelError", "ModelsMissingCwd", "ModelNames", "ModelScopeWarnings", "IsModelScopeActive", "AllModelList", "ModelThinkingLevels", "ModelThinkingLevelMaps", "ModelList", "NewSessionDefaultModel", "NewSessionDefaultThinkingLevel", "ModelThinkingDefaults", "NewSessionModel", "NewSessionThinkingLevel"]) {
     context[`set${name}`] = (value) => writes.push([name, value]);
   }
   context.loadModels = loadScript.runInNewContext(context);
@@ -145,6 +145,66 @@ test("cancelling model loads prevents state writes and further retries", async (
   await waiting.run();
   assert.equal(attempts, 1);
 });
+
+test("all-scope models update the synchronous supported-effort ref too", async () => {
+  const state = setup(async () => Response.json({
+    models: { "outside:reasoner": "Reasoner" },
+    thinkingLevels: { "outside:reasoner": ["off", "xhigh"] },
+    modelList: [{ provider: "outside", id: "reasoner", name: "Reasoner" }],
+  }));
+  const allLoader = nodes.find((node) => ts.isVariableDeclaration(node) && node.name.getText(source) === "loadAllModels");
+  const completed = Promise.withResolvers();
+  state.context.addNotice = (notice) => completed.reject(new Error(notice.message));
+  state.context.setAllModelList = () => completed.resolve();
+  script(`(${allLoader.initializer.arguments[0].getText(source)})`).runInNewContext(state.context)();
+  await completed.promise;
+  assert.deepEqual(Array.from(state.context.modelThinkingLevelsRef.current["outside:reasoner"]), ["off", "xhigh"]);
+});
+
+for (const reselect of [false, true]) {
+  test(`streaming model ${reselect ? "reselect" : "switch"} confirms live state without replacing history`, async () => {
+    const calls = [], synced = [];
+    const target = { provider: "custom", modelId: "reasoner" };
+    const context = {
+      isNew: false, currentModelOverride: null, console,
+      modelThinkingDefault, clampSupportedThinkingLevel,
+      asConcreteThinkingLevel: (value) => value ?? null,
+      modelSelectionEpochRef: { current: 0 }, sessionMountGenerationRef: { current: 1 },
+      sessionHookMountedRef: { current: true }, sessionIdRef: { current: "streaming" },
+      agentRunningRef: { current: true }, bashRunningRef: { current: false },
+      modelSwitchPendingRef: { current: false }, modelSwitchFlightRef: { current: null },
+      sessionReadIdRef: { current: 4 }, sessionReadAppliedIdRef: { current: 0 },
+      sessionSettingsReadFloorRef: { current: 0 }, thinkingLevelChangeIdRef: { current: 0 },
+      thinkingLevelOverrideRef: { current: null },
+      displayModelRef: { current: reselect ? target : { provider: "custom", modelId: "old" } },
+      modelThinkingLevelsRef: { current: { "custom:reasoner": ["off", "low", "medium"] } },
+      thinkingLevelPinsRef: { current: {} }, modelThinkingDefaultsRef: { current: { "custom/reasoner": "low" } },
+      defaultThinkingLevelRef: { current: "medium" },
+      setModelSwitching() {}, setCurrentModelOverride() {}, setCurrentThinkingOverride() {},
+      setLiveModel() {}, setLiveThinkingLevel() {},
+      addNotice(notice) { assert.fail(notice.message); },
+      loadSession() { assert.fail("a streaming switch must not read/replace history"); },
+      syncLiveModel(state) { synced.push(state); },
+      agentStatusUrl: (sid) => `/api/agent/${sid}?systemPrompt=0`,
+      sendAgentCommand: async (_sid, command) => {
+        calls.push(command);
+        return command.type === "set_model" ? { provider: target.provider, id: target.modelId } : null;
+      },
+      fetch: async (url) => {
+        assert.equal(url, "/api/agent/streaming?systemPrompt=0");
+        return Response.json({ state: { model: { provider: target.provider, id: target.modelId }, thinkingLevel: "low" } });
+      },
+    };
+    const handler = nodes.find((node) => ts.isVariableDeclaration(node) && node.name.getText(source) === "handleModelChange");
+    await script(`(${handler.initializer.arguments[0].getText(source)})`).runInNewContext(context)(target.provider, target.modelId);
+    assert.deepEqual(calls.map((command) => command.type), reselect ? ["set_model"] : ["set_model", "set_thinking_level"]);
+    if (!reselect) assert.equal(calls[1].level, "low", "the target's per-model default beats a stale wrapper fallback");
+    assert.equal(synced.length, 1);
+    assert.equal(synced[0].thinkingLevel, "low");
+    assert.equal(context.sessionReadAppliedIdRef.current, 5);
+    assert.equal(context.modelSwitchPendingRef.current, false);
+  });
+}
 
 test("a picked model the folder offers keeps its pinned reasoning level; one it does not list goes back to automatic", async () => {
   const catalog = {

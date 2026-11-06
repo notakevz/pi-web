@@ -18,7 +18,9 @@ test("running mode stays visible and disabled beside active-mode Steer/Follow-up
   assert.ok(mode, "mode menu remains visible");
   assert.match(mode, /disabled=""/);
   assert.match(html, />plan<\/span>/);
-  assert.match(html, />Steer<\/button>/);
-  assert.match(html, />Follow-up<\/button>/);
+  assert.ok(button(html, "Steer"));
+  assert.ok(button(html, "Follow-up"));
+  assert.match(html, /class="chat-composer-run-label">Steer<\/span>/);
+  assert.match(html, /class="chat-composer-run-label">Follow-up<\/span>/);
   assert.equal(button(html, "Send"), undefined);
 });
